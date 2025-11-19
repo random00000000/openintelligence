@@ -17,7 +17,7 @@ PromptChain relies on your local Ollama installation for inference, so install O
 ## 4. Configure CORS for browser access
 Ollama enforces CORS restrictions by default. Set the `OLLAMA_ORIGINS=*` environment variable (or a more restrictive value that includes `file://`) before starting Ollama so that your browser can reach the local API from the standalone HTML file.
 
-n Windows, do this:
+On Windows, do this:
 
 Open Control Panel → System → Advanced system settings
 
