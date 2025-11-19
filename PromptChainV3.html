@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Data Processor – Prompt Chain</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 900px;
+      margin: 20px auto;
+      line-height: 1.4;
+    }
+    h1 {
+      margin-bottom: 8px;
+    }
+    #steps {
+      margin: 16px 0;
+      border: 1px solid #444;
+      padding: 10px;
+      border-radius: 4px;
+    }
+    .step {
+      border-bottom: 1px solid #333;
+      padding: 8px 0;
+    }
+    .step:last-child {
+      border-bottom: none;
+    }
+    .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-size: 0.95rem;
+    }
+    .step-title {
+      font-weight: 600;
+    }
+    .step-remove {
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      font-size: 0.85rem;
+      color: #c00;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      font-family: inherit;
+    }
+    #initialInput, .step-prompt {
+      min-height: 70px;
+    }
+    .step-output {
+      margin-top: 4px;
+      border: 1px solid #555;
+      border-radius: 3px;
+      padding: 6px;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+      max-height: 150px;
+      overflow-y: auto;
+      background: #111;
+      color: #ddd;
+    }
+    #controls {
+      margin-top: 10px;
+    }
+    button {
+      margin-top: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    #finalOutput {
+      margin-top: 16px;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 8px;
+      background: #050505;
+      color: #eee;
+      white-space: pre-wrap;
+      max-height: 220px;
+      overflow-y: auto;
+    }
+    #status {
+      margin-top: 6px;
+      font-size: 0.85rem;
+      color: #666;
+    }
+    label {
+      display: block;
+      margin: 8px 0 4px;
+      font-size: 0.95rem;
+    }
+
+    /* --- chain save/load UI --- */
+    #chainControls {
+      margin-top: 14px;
+      padding: 8px;
+      border: 1px solid #444;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    #chainControls input[type="text"] {
+      padding: 4px 6px;
+      font-size: 0.9rem;
+    }
+    #savedChainsSelect {
+      padding: 4px 6px;
+      font-size: 0.9rem;
+      max-width: 220px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Data Processor – Prompt Chain</h1>
+  <p style="font-size:0.9rem; color:#666;">
+    Define a sequence of prompts. The output of each step becomes the input of the next one.
+  </p>
+
+  <!-- Chain save/load controls (now above system prompt) -->
+  <div id="chainControls">
+    <div>
+      <label style="margin:0 0 2px 0;">Chain name:</label>
+      <input type="text" id="chainName" placeholder="e.g. Summarize → Translate → Format" />
+    </div>
+
+    <button id="saveChainBtn" type="button">Save chain</button>
+
+    <div>
+      <label style="margin:0 0 2px 0;">Saved chains:</label>
+      <select id="savedChainsSelect">
+        <option value="">— select a chain —</option>
+      </select>
+    </div>
+
+    <button id="loadChainBtn" type="button">Load</button>
+    <button id="deleteChainBtn" type="button">Delete</button>
+  </div>
+
+  <label>
+    Global system prompt (optional):
+    <textarea id="system" rows="2" placeholder="You are a helpful text-processing assistant."></textarea>
+  </label>
+
+  <label>
+    Initial input data:
+    <textarea id="initialInput" rows="4" placeholder="Paste or type the starting text here..."></textarea>
+  </label>
+
+  <!-- Step 0 model output -->
+  <h3 style="margin-top:8px;">Initial data snapshot (Step 0 output)</h3>
+  <div id="initialOutput" class="step-output">
+    Will show the model's output when running the initial input as Step 0.
+  </div>
+
+  <div id="steps"></div>
+
+  <div id="controls">
+    <button id="addStepBtn">+ Add step</button>
+    <button id="runBtn" style="margin-left: 10px;">Run chain</button>
+    <button id="clearOutputsBtn" style="margin-left: 10px;">Clear outputs</button>
+  </div>
+
+  <div id="status"></div>
+
+  <h2 style="margin-top:18px;">Final output</h2>
+  <div id="finalOutput" placeholder="Final result will appear here..."></div>
+
+  <script>
+    // -------- CONFIG --------
+    const API_URL = 'http://localhost:11434/api/chat'; // your Ollama API
+    const MODEL   = 'deepseek-r1:8b';                  // model name
+
+    // -------- DOM --------
+    const systemEl         = document.getElementById('system');
+    const initialInputEl   = document.getElementById('initialInput');
+    const initialOutputEl  = document.getElementById('initialOutput');
+    const stepsContainer   = document.getElementById('steps');
+    const addStepBtn       = document.getElementById('addStepBtn');
+    const runBtn           = document.getElementById('runBtn');
+    const clearOutputsBtn  = document.getElementById('clearOutputsBtn');
+    const finalOutputEl    = document.getElementById('finalOutput');
+    const statusEl         = document.getElementById('status');
+
+    // Chain save/load elements
+    const chainNameEl        = document.getElementById('chainName');
+    const saveChainBtn       = document.getElementById('saveChainBtn');
+    const loadChainBtn       = document.getElementById('loadChainBtn');
+    const deleteChainBtn     = document.getElementById('deleteChainBtn');
+    const savedChainsSelect  = document.getElementById('savedChainsSelect');
+
+    // -------- STATE --------
+    let stepCounter = 0;
+    const STORAGE_KEY = 'promptChains_v1';
+
+    // -------- HELPERS --------
+    function createStep(initialPrompt = '') {
+      stepCounter++;
+
+      const step = document.createElement('div');
+      step.className = 'step';
+
+      const header = document.createElement('div');
+      header.className = 'step-header';
+
+      const title = document.createElement('span');
+      title.className = 'step-title';
+      title.textContent = 'Step ' + stepCounter;
+
+      const removeBtn = document.createElement('button');
+      removeBtn.type = 'button';
+      removeBtn.className = 'step-remove';
+      removeBtn.textContent = 'Remove';
+      removeBtn.addEventListener('click', () => {
+        stepsContainer.removeChild(step);
+        renumberSteps();
+      });
+
+      header.appendChild(title);
+      header.appendChild(removeBtn);
+
+      const promptArea = document.createElement('textarea');
+      promptArea.className = 'step-prompt';
+      promptArea.placeholder = 'Describe what this step should do with the input...';
+      promptArea.value = initialPrompt;
+
+      const output = document.createElement('div');
+      output.className = 'step-output';
+      output.textContent = 'Output will appear here...';
+
+      step.appendChild(header);
+      step.appendChild(promptArea);
+      step.appendChild(output);
+
+      stepsContainer.appendChild(step);
+      return step;
+    }
+
+    function renumberSteps() {
+      const steps = stepsContainer.querySelectorAll('.step');
+      let n = 1;
+      steps.forEach(step => {
+        const titleEl = step.querySelector('.step-title');
+        titleEl.textContent = 'Step ' + n;
+        n++;
+      });
+      stepCounter = steps.length;
+    }
+
+    async function callOllama(messages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          messages,
+          stream: false
+        })
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      return data.message?.content || '';
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    // -------- CHAIN SAVE / LOAD (localStorage) --------
+
+    function getStoredChains() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        if (typeof parsed !== 'object' || parsed === null) return {};
+        return parsed;
+      } catch (e) {
+        console.error('Failed to read chains from localStorage', e);
+        return {};
+      }
+    }
+
+    function saveStoredChains(chains) {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(chains));
+      } catch (e) {
+        console.error('Failed to save chains to localStorage', e);
+      }
+      updateSavedChainsSelect();
+    }
+
+    function captureCurrentChain() {
+      const steps = stepsContainer.querySelectorAll('.step');
+      const stepPrompts = Array.from(steps).map(step =>
+        step.querySelector('.step-prompt').value || ''
+      );
+      return {
+        system: systemEl.value || '',
+        initialInput: initialInputEl.value || '',
+        steps: stepPrompts
+      };
+    }
+
+    function loadChainIntoUI(chain) {
+      // system prompt
+      systemEl.value = chain.system || '';
+
+      // initial input
+      initialInputEl.value = chain.initialInput || '';
+
+      // clear existing steps
+      stepsContainer.innerHTML = '';
+      stepCounter = 0;
+
+      // recreate steps
+      const prompts = Array.isArray(chain.steps) ? chain.steps : [];
+      if (prompts.length === 0) {
+        createStep('');
+      } else {
+        prompts.forEach(p => createStep(p));
+      }
+
+      // clear outputs (but keep initial input from chain)
+      clearOutputs();
+    }
+
+    function updateSavedChainsSelect() {
+      const chains = getStoredChains();
+      const currentValue = savedChainsSelect.value;
+
+      // clear all options
+      while (savedChainsSelect.firstChild) {
+        savedChainsSelect.removeChild(savedChainsSelect.firstChild);
+      }
+
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = '— select a chain —';
+      savedChainsSelect.appendChild(placeholder);
+
+      Object.keys(chains).sort().forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        savedChainsSelect.appendChild(opt);
+      });
+
+      // try to restore previous selection if still present
+      if (chains[currentValue]) {
+        savedChainsSelect.value = currentValue;
+      } else {
+        savedChainsSelect.value = '';
+      }
+    }
+
+    function handleSaveChain() {
+      const name = chainNameEl.value.trim();
+      if (!name) {
+        alert('Please enter a name for this chain.');
+        return;
+      }
+
+      const chains = getStoredChains();
+      const exists = !!chains[name];
+
+      if (exists) {
+        const overwrite = confirm('A chain with this name already exists. Overwrite it?');
+        if (!overwrite) return;
+      }
+
+      const chainDef = captureCurrentChain();
+      chains[name] = chainDef;
+      saveStoredChains(chains);
+      setStatus('Chain "' + name + '" saved.');
+    }
+
+    function handleLoadChain() {
+      const name = savedChainsSelect.value;
+      if (!name) {
+        alert('Please select a saved chain to load.');
+        return;
+      }
+
+      const chains = getStoredChains();
+      const chain = chains[name];
+      if (!chain) {
+        alert('Chain not found.');
+        updateSavedChainsSelect();
+        return;
+      }
+
+      loadChainIntoUI(chain);
+      chainNameEl.value = name;
+      setStatus('Chain "' + name + '" loaded.');
+    }
+
+    function handleDeleteChain() {
+      const name = savedChainsSelect.value || chainNameEl.value.trim();
+      if (!name) {
+        alert('Select a chain or type its name to delete.');
+        return;
+      }
+
+      const chains = getStoredChains();
+      if (!chains[name]) {
+        alert('No saved chain with that name.');
+        return;
+      }
+
+      const confirmDelete = confirm('Delete chain "' + name + '"? This cannot be undone.');
+      if (!confirmDelete) return;
+
+      delete chains[name];
+      saveStoredChains(chains);
+      if (savedChainsSelect.value === name) {
+        savedChainsSelect.value = '';
+      }
+      if (chainNameEl.value.trim() === name) {
+        chainNameEl.value = '';
+      }
+      setStatus('Chain "' + name + '" deleted.');
+    }
+
+    // -------- CORE: RUN CHAIN --------
+    async function runChain() {
+      const initialText = initialInputEl.value.trim();
+      if (!initialText) {
+        alert('Please provide some initial input data.');
+        return;
+      }
+
+      const steps = stepsContainer.querySelectorAll('.step');
+      if (steps.length === 0) {
+        alert('Add at least one step.');
+        return;
+      }
+
+      runBtn.disabled = true;
+      addStepBtn.disabled = true;
+      clearOutputsBtn.disabled = true;
+      setStatus('Running chain...');
+
+      const globalSystem = systemEl.value.trim();
+
+      // Clear previous outputs
+      finalOutputEl.textContent = '';
+      steps.forEach(step => {
+        const out = step.querySelector('.step-output');
+        out.textContent = 'Output will appear here...';
+      });
+
+      try {
+        // ----- STEP 0: run the initial input as a model call -----
+        setStatus('Running Step 0 (initial input)...');
+
+        const messages0 = [];
+        if (globalSystem) {
+          messages0.push({
+            role: 'system',
+            content: globalSystem
+          });
+        }
+
+        // Initial input acts as the user prompt for Step 0
+        messages0.push({
+          role: 'user',
+          content: initialText
+        });
+
+        const step0Result = (await callOllama(messages0)).trim();
+        const step0Output = step0Result || '[Empty output]';
+
+        // Show Step 0 output
+        initialOutputEl.textContent = step0Output;
+
+        // This becomes the starting text for Step 1
+        let currentText = step0Result || initialText;
+
+        // ----- STEPS 1..N -----
+        let stepIndex = 0;
+        for (const step of steps) {
+          stepIndex++;
+          const promptEl = step.querySelector('.step-prompt');
+          const outputEl = step.querySelector('.step-output');
+          const instruction = promptEl.value.trim();
+
+          if (!instruction) {
+            outputEl.textContent = '[Skipped – empty prompt]';
+            continue;
+          }
+
+          outputEl.textContent = 'Running...';
+
+          const messages = [];
+
+          if (globalSystem) {
+            messages.push({
+              role: 'system',
+              content: globalSystem
+            });
+          }
+
+          messages.push({
+            role: 'user',
+            content:
+              'Instruction:\n' + instruction +
+              '\n\n--- INPUT START ---\n' +
+              currentText +
+              '\n--- INPUT END ---\n\n' +
+              'Return ONLY the transformed output.'
+          });
+
+          const result = (await callOllama(messages)).trim();
+          currentText = result || currentText; // if model returns empty, keep previous
+          outputEl.textContent = result || '[Empty output]';
+
+          setStatus('Completed step ' + stepIndex + ' of ' + steps.length);
+        }
+
+        finalOutputEl.textContent = currentText;
+        setStatus('Chain finished.');
+      } catch (err) {
+        console.error(err);
+        setStatus('Error: ' + err.message);
+      } finally {
+        runBtn.disabled = false;
+        addStepBtn.disabled = false;
+        clearOutputsBtn.disabled = false;
+      }
+    }
+
+    function clearOutputs() {
+      finalOutputEl.textContent = '';
+      const steps = stepsContainer.querySelectorAll('.step-output');
+      steps.forEach(out => {
+        out.textContent = 'Output will appear here...';
+      });
+      initialOutputEl.textContent = 'Will show the model\'s output when running the initial input as Step 0.';
+      setStatus('');
+    }
+
+    // -------- EVENT WIRES --------
+    addStepBtn.addEventListener('click', () => createStep());
+    runBtn.addEventListener('click', runChain);
+    clearOutputsBtn.addEventListener('click', clearOutputs);
+
+    // save/load/delete events
+    saveChainBtn.addEventListener('click', handleSaveChain);
+    loadChainBtn.addEventListener('click', handleLoadChain);
+    deleteChainBtn.addEventListener('click', handleDeleteChain);
+
+    // Allow Ctrl+Enter / Cmd+Enter on initial input to run chain
+    initialInputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        runChain();
+      }
+    });
+
+    // Init
+    createStep('First, summarize the input clearly in 3–5 bullet points.');
+    updateSavedChainsSelect();
+  </script>
+</body>
+</html>
