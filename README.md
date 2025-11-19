@@ -17,6 +17,22 @@ PromptChain relies on your local Ollama installation for inference, so install O
 ## 4. Configure CORS for browser access
 Ollama enforces CORS restrictions by default. Set the `OLLAMA_ORIGINS=*` environment variable (or a more restrictive value that includes `file://`) before starting Ollama so that your browser can reach the local API from the standalone HTML file.
 
+n Windows, do this:
+
+Open Control Panel → System → Advanced system settings
+
+Click Environment Variables…
+
+Under User variables (or System variables if you want it global), click New…
+
+Variable name: OLLAMA_ORIGINS
+
+Variable value (for development): *
+
+Later you can tighten it to http://localhost:8000 if you want.
+
+Click OK until all dialogs are closed.
+
 ## 5. Chain prompts
 With the page open and Ollama running, start creating prompt chains to explore different reasoning steps or personas. Each prompt in the chain feeds into the next, allowing you to craft richer multi-step interactions.
 
