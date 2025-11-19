@@ -1,3 +1,6 @@
+<img width="928" height="940" alt="image" src="https://github.com/user-attachments/assets/afeef3fa-e282-40c5-9707-52389ab38fe3" />
+
+
 # PromptChain Tutorial
 
 PromptChain is a single-page HTML tool for chaining multiple prompts together when working with Ollama models. This README is a quick tutorial for getting the app running locally in your browser.
