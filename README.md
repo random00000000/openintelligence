@@ -13,6 +13,7 @@ Double-click the HTML file or drag it into your browser. Because the entire inte
 
 ## 3. Make sure Ollama is installed
 PromptChain relies on your local Ollama installation for inference, so install Ollama if you have not already. Once installed, keep the Ollama service running in the background while you use PromptChain. The app works completely offline because every call is routed to your local Ollama runtime—no cloud APIs involved.
+https://ollama.com/download/windows
 
 ## 4. Configure CORS for browser access
 Ollama enforces CORS restrictions by default. Set the `OLLAMA_ORIGINS=*` environment variable (or a more restrictive value that includes `file://`) before starting Ollama so that your browser can reach the local API from the standalone HTML file.
