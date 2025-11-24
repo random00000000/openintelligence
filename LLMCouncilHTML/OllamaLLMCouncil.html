@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ollama LLM Council</title>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 960px;
+      margin: 24px auto;
+      padding: 0 12px;
+      line-height: 1.5;
+    }
+    h1, h2 { margin-bottom: 8px; }
+    #log {
+      border: 1px solid #444;
+      padding: 12px;
+      height: 460px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      background: #fafafa;
+    }
+    .msg-user { font-weight: bold; margin-bottom: 6px; }
+    .msg-assistant { color: #006400; margin-bottom: 6px; }
+    .msg-meta { color: #555; font-style: italic; margin-bottom: 6px; }
+    textarea, input[type="number"] {
+      width: 100%;
+      box-sizing: border-box;
+      font-family: inherit;
+    }
+    textarea { resize: vertical; }
+    label { display: block; margin: 10px 0; }
+    button { margin-top: 10px; padding: 8px 12px; font-size: 1rem; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Ollama LLM Council</h1>
+  <p>
+    This page mirrors Andrej Karpathy's <em>llm-council</em> flow: a council of specialists responds to
+    a user question and a Mayor synthesizes the final answer. Everything runs against your local
+    Ollama instance through the HTTP API.
+  </p>
+
+  <label>
+    Global system prompt (applied to every request):
+    <textarea id="system" rows="2" placeholder="You are a helpful assistant."></textarea>
+  </label>
+
+  <label>
+    Mayor directive (steers the final synthesize step):
+    <textarea id="mayor" rows="3" placeholder="You are the Mayor. Read all council responses, resolve disagreements, and deliver a crisp, actionable answer for the user."></textarea>
+  </label>
+
+  <label>
+    Council roles (one per line, format: Name: description):
+    <textarea id="roles" rows="4" placeholder="Researcher: Surfaces background knowledge and prior art.
+Builder: Produces concrete plans and code when relevant.
+Skeptic: Spots risks, edge cases, and missing details.
+Storyteller: Communicates the plan clearly for humans."></textarea>
+  </label>
+
+  <label>
+    Number of council members (1–8):
+    <input id="memberCount" type="number" min="1" max="8" value="4" />
+  </label>
+
+  <label>
+    Deliberation rounds (each round replays the council with the running transcript):
+    <input id="roundCount" type="number" min="1" max="3" value="1" />
+  </label>
+
+  <div id="log"></div>
+
+  <label>
+    Your question:
+    <textarea id="input" rows="3" placeholder="What do you want the council to solve?"></textarea>
+  </label>
+  <button id="sendBtn">Ask the council</button>
+  <small>Press Ctrl+Enter (or Cmd+Enter) to submit.</small>
+
+  <script>
+    const API_URL = 'http://localhost:11434/api/chat';
+    const MODEL   = 'deepseek-r1:8b';
+
+    const logDiv       = document.getElementById('log');
+    const inputEl      = document.getElementById('input');
+    const systemEl     = document.getElementById('system');
+    const rolesEl      = document.getElementById('roles');
+    const mayorEl      = document.getElementById('mayor');
+    const sendBtn      = document.getElementById('sendBtn');
+    const memberCountEl= document.getElementById('memberCount');
+    const roundCountEl = document.getElementById('roundCount');
+
+    const DEFAULT_MEMBERS = [
+      { name: 'Researcher', system: 'You surface background knowledge, tradeoffs, and prior art.' },
+      { name: 'Builder',    system: 'You draft concrete plans, code sketches, and implementation details.' },
+      { name: 'Skeptic',    system: 'You stress test ideas, find risks, and point out missing steps.' },
+      { name: 'Storyteller',system: 'You translate technical points into clear, user-focused language.' },
+      { name: 'Optimizer',  system: 'You simplify, improve performance, and trim unnecessary work.' }
+    ];
+
+    function clampNumber(raw, min, max, fallback) {
+      let n = parseInt(raw, 10);
+      if (isNaN(n)) n = fallback;
+      n = Math.max(min, n);
+      n = Math.min(max, n);
+      return n;
+    }
+
+    function buildCouncilMembers(n) {
+      const text = rolesEl.value.trim();
+      if (!text) {
+        return DEFAULT_MEMBERS
+          .slice(0, n)
+          .map(m => ({ name: m.name, system: m.system }));
+      }
+
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      const members = [];
+      for (let i = 0; i < lines.length && members.length < n; i++) {
+        const line = lines[i];
+        const parts = line.split(':');
+        const name = (parts[0] || '').trim() || `Member ${members.length + 1}`;
+        const desc = parts.slice(1).join(':').trim() || 'You are an expert contributor. Add a helpful response.';
+        members.push({ name, system: `You are ${name}. ${desc}` });
+      }
+
+      while (members.length < n) {
+        const idx = members.length + 1;
+        members.push({
+          name: `Member ${idx}`,
+          system: `You are Member ${idx}. Provide the most insightful, detailed contribution you can.`
+        });
+      }
+      return members;
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      div.className = role === 'meta' ? 'msg-meta' : (role === 'user' ? 'msg-user' : 'msg-assistant');
+      div.textContent = content;
+      logDiv.appendChild(div);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    async function callOllama(messages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: MODEL, messages, stream: false })
+      });
+
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      return data.message?.content || '(no content)';
+    }
+
+    async function askCouncil() {
+      const question = inputEl.value.trim();
+      if (!question) return;
+
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      addMessage('user', 'User: ' + question);
+
+      const globalSystem = systemEl.value.trim();
+      const mayorPrompt  = mayorEl.value.trim() || 'You are the Mayor. Weigh the council responses and give the best direct reply.';
+      const memberCount  = clampNumber(memberCountEl.value, 1, 8, 4);
+      const roundCount   = clampNumber(roundCountEl.value, 1, 3, 1);
+      const members      = buildCouncilMembers(memberCount);
+
+      const councilResponses = [];
+      let runningTranscript = '';
+
+      try {
+        for (let round = 1; round <= roundCount; round++) {
+          addMessage('meta', `--- Round ${round} of ${roundCount} ---`);
+          for (const member of members) {
+            addMessage('meta', `[${member.name} is responding...]`);
+
+            const msgs = [];
+            if (globalSystem) {
+              msgs.push({ role: 'system', content: globalSystem });
+            }
+            msgs.push({ role: 'system', content: member.system });
+
+            const councilPrompt =
+              `User question:\n${question}\n\n` +
+              (runningTranscript
+                ? `Transcript so far (round ${round}):\n${runningTranscript}\n\n`
+                : '') +
+              `${member.name}, add your contribution to the council. Be concise, avoid repetition, and stick to your specialty.`;
+
+            msgs.push({ role: 'user', content: councilPrompt });
+
+            let reply;
+            try {
+              reply = await callOllama(msgs);
+            } catch (err) {
+              reply = `Error from ${member.name}: ${err.message}`;
+            }
+
+            councilResponses.push({ memberName: member.name, text: reply });
+            addMessage('assistant', `${member.name}: ${reply}`);
+
+            runningTranscript += `${member.name}: ${reply}\n\n`;
+          }
+        }
+
+        const mayorMessages = [];
+        if (globalSystem) {
+          mayorMessages.push({ role: 'system', content: globalSystem });
+        }
+        mayorMessages.push({ role: 'system', content: mayorPrompt });
+
+        const bulletList = councilResponses
+          .map(r => `- ${r.memberName}: ${r.text}`)
+          .join('\n');
+
+        mayorMessages.push({
+          role: 'user',
+          content:
+            `User question:\n${question}\n\n` +
+            `Council transcript:\n${runningTranscript.trim() || bulletList}\n\n` +
+            `Deliver the final Mayor response, referencing and reconciling the council where helpful.`
+        });
+
+        const mayorReply = await callOllama(mayorMessages);
+        addMessage('assistant', `Mayor: ${mayorReply}`);
+      } catch (err) {
+        addMessage('assistant', 'Request failed: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener('click', askCouncil);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        askCouncil();
+      }
+    });
+  </script>
+</body>
+</html>
