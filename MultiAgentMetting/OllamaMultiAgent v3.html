@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ollama Multi-Agent Chat</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 20px auto; }
+    #chat { border: 1px solid #444; padding: 10px; height: 400px; overflow-y: auto; white-space: pre-wrap; }
+    .msg-user { font-weight: bold; margin-bottom: 4px; }
+    .msg-assistant { color: #0a0; margin-bottom: 4px; }
+    .msg-meta { color: #666; font-style: italic; margin-bottom: 4px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button { margin-top: 8px; }
+    label { display: block; margin: 8px 0; }
+    input[type="number"] { width: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Ollama Multi-Agent Chat</h1>
+
+  <label>
+    System prompt (optional, global for everyone & the orchestrator):
+    <textarea id="system" rows="2" placeholder="You are a helpful assistant."></textarea>
+  </label>
+
+  <label>
+    Team roles (one per line, format: Name: description):
+    <textarea id="roles" rows="4" placeholder="Tarentino style Movie Writer
+Netflix TV Series Writer
+Game Development Assistant"></textarea>
+  </label>
+
+  <label>
+    Number of assistants in the meeting (1–8):
+    <input id="agentCount" type="number" min="1" max="8" value="3" />
+  </label>
+
+  <div id="chat"></div>
+
+  <label>
+    Your message:
+    <textarea id="input" rows="3" placeholder="Type a message..."></textarea>
+  </label>
+  <button id="sendBtn">Send</button>
+
+  <script>
+    const API_URL = 'http://localhost:11434/api/chat'; // local Ollama API
+    const MODEL   = 'deepseek-r1:8b';                  // change to whatever you pulled
+
+    const chatDiv      = document.getElementById('chat');
+    const inputEl      = document.getElementById('input');
+    const systemEl     = document.getElementById('system');
+    const rolesEl      = document.getElementById('roles');
+    const sendBtn      = document.getElementById('sendBtn');
+    const agentCountEl = document.getElementById('agentCount');
+
+    // Toggle this to hide/show the panel notes in the UI
+    const SHOW_PANEL_NOTES = true;
+
+    // UI-only chat log
+    const messages = [];
+
+    // localStorage keys
+    const STORAGE_KEY_SYSTEM      = 'ollama_multi_agent_system';
+    const STORAGE_KEY_ROLES       = 'ollama_multi_agent_roles';
+    const STORAGE_KEY_AGENT_COUNT = 'ollama_multi_agent_agent_count';
+
+    // Load saved settings on startup
+    (function loadSavedSettings() {
+      try {
+        const savedSystem = localStorage.getItem(STORAGE_KEY_SYSTEM);
+        const savedRoles  = localStorage.getItem(STORAGE_KEY_ROLES);
+        const savedCount  = localStorage.getItem(STORAGE_KEY_AGENT_COUNT);
+
+        if (savedSystem !== null) {
+          systemEl.value = savedSystem;
+        }
+
+        if (savedRoles !== null) {
+          rolesEl.value = savedRoles;
+        }
+
+        if (savedCount !== null) {
+          agentCountEl.value = savedCount;
+        }
+      } catch (e) {
+        console.warn('Could not load saved settings:', e);
+      }
+    })();
+
+    // Default templates if no custom roles are given
+    const DEFAULT_AGENT_TEMPLATES = [
+      {
+        name: 'Architect',
+        system: 'You think in structure, beats, and pipelines. You design clear, step-by-step solutions and story shapes.'
+      },
+      {
+        name: 'Skeptic',
+        system: 'You look for flaws, missing info, and risks. You point out what will break or confuse the player.'
+      },
+      {
+        name: 'Pragmatist',
+        system: 'You focus on simple, practical, shippable solutions. You remove bloat and keep what matters.'
+      },
+      {
+        name: 'Researcher',
+        system: 'You recall patterns, best practices, and references from games, films, and systems similar to this one.'
+      }
+    ];
+
+    function clampAgentsCount(raw) {
+      let n = parseInt(raw, 10);
+      if (isNaN(n)) n = 1;
+      n = Math.max(1, n);
+      n = Math.min(8, n);
+      return n;
+    }
+
+    function buildAgentsFromRolesText(n) {
+      const text = rolesEl.value.trim();
+      if (!text) {
+        // Fall back to defaults
+        return DEFAULT_AGENT_TEMPLATES
+          .slice(0, n)
+          .map(a => ({ name: a.name, system: a.system }));
+      }
+
+      const lines = text.split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      const agents = [];
+
+      for (let i = 0; i < lines.length && agents.length < n; i++) {
+        const line = lines[i];
+        const parts = line.split(':');
+        const namePart = (parts[0] || '').trim();
+        const descPart = parts.slice(1).join(':').trim();
+
+        const name = namePart || `Agent ${agents.length + 1}`;
+
+        let desc;
+        if (descPart) {
+          desc = descPart;
+        } else {
+          // If user only wrote a name, turn it into a role description
+          desc = `Act as ${name}, a highly capable specialist. Provide high-quality ideas, critiques, and improvements in your domain.`;
+        }
+
+        agents.push({
+          name,
+          system: desc
+        });
+      }
+
+      // If fewer lines than n, pad with generic agents
+      while (agents.length < n) {
+        const idx = agents.length + 1;
+        agents.push({
+          name: `Agent ${idx}`,
+          system: `Act as Agent ${idx}, an expert assistant. Provide sharp, concrete suggestions and critiques.`
+        });
+      }
+
+      return agents;
+    }
+
+    function getActiveAgents() {
+      const n = clampAgentsCount(agentCountEl.value);
+      return buildAgentsFromRolesText(n);
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      if (role === 'meta') {
+        div.className = 'msg-meta';
+        div.textContent = content;
+      } else {
+        div.className = 'msg-' + role;
+        div.textContent = (role === 'user' ? 'You: ' : 'Bot: ') + content;
+      }
+      chatDiv.appendChild(div);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    async function callOllama(chatMessages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          stream: false
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('HTTP ' + res.status);
+      }
+
+      const data = await res.json();
+      return data.message?.content || '(no content)';
+    }
+
+    async function sendMessage() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      // Show user message in UI
+      messages.push({ role: 'user', content: text });
+      addMessage('user', text);
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      const agents = getActiveAgents();
+      const globalSystem = systemEl.value.trim();
+
+      const agentReplies = [];
+      let panelTranscript = ''; // all expert notes so far
+
+      try {
+        // 1) Run each assistant sequentially as a PANEL of INTERNAL EXPERTS
+        for (const agent of agents) {
+          addMessage('meta', `[${agent.name} is thinking...]`);
+
+          const agentMessages = [];
+
+          if (globalSystem) {
+            agentMessages.push({
+              role: 'system',
+              content: globalSystem
+            });
+          }
+
+          // Role for this agent as an internal note-generator
+          agentMessages.push({
+            role: 'system',
+            content:
+              `You are ${agent.name}, an internal expert assisting with the Hardcore Survival project.\n` +
+              `${agent.system}\n\n` +
+              `Your output is NEVER shown to the user. It is only used by an orchestrator model.`
+          });
+
+          // Build panel-style user prompt for this agent
+          const panelContext = panelTranscript
+            ? `Here are concise internal notes from other experts so far:\n\n${panelTranscript}\n\n`
+            : '';
+
+          const agentPrompt =
+            `The user just asked:\n"${text}"\n\n` +
+            panelContext +
+            `Your task now:\n` +
+            `• Do NOT write the final answer.\n` +
+            `• Do NOT write scenes, dialogue, or long paragraphs.\n` +
+            `• In 3–8 short bullet points, suggest improvements, angles, twists, constraints, or checks that will make the final answer stronger.\n` +
+            `• Focus on being concrete and useful (structure, pacing, clarity, style, game design, etc.).\n` +
+            `• Avoid repeating previous notes; extend or critique them.\n` +
+            `Output ONLY bullet points starting with "- ".`;
+
+          agentMessages.push({
+            role: 'user',
+            content: agentPrompt
+          });
+
+          let reply;
+          try {
+            reply = await callOllama(agentMessages);
+          } catch (err) {
+            reply = `Error from ${agent.name}: ${err.message}`;
+          }
+
+          agentReplies.push({ agentName: agent.name, text: reply });
+
+          if (SHOW_PANEL_NOTES) {
+            addMessage('assistant', `${agent.name} (notes):\n${reply}`);
+          }
+
+          // Update panel transcript for the next expert
+          panelTranscript += `${agent.name} notes:\n${reply}\n\n`;
+        }
+
+        // 2) Orchestrator: read panel notes & answer the user ONCE
+        const meetingTranscript = panelTranscript.trim() ||
+          agentReplies
+            .map(ar => `${ar.agentName} notes:\n${ar.text}`)
+            .join('\n\n---\n\n');
+
+        const orchestratorSystem =
+          (globalSystem ? globalSystem + '\n\n' : '') +
+          'You are the Orchestrator for a team of expert assistants working on the Hardcore Survival project.\n' +
+          'You are the ONLY one whose output is shown to the user.\n\n' +
+          'RULES:\n' +
+          '• Carefully read the user request and the internal panel notes.\n' +
+          '• Obey the user’s latest instructions and requested format exactly.\n' +
+          '• Use the panel notes only as guidance; do NOT mention them or describe your process.\n' +
+          '• Prefer concise, concrete, game-ready or code-ready output over long meta commentary.\n' +
+          '• If the user asks for a specific structure (e.g., "3 characters, each with bark + 4 sentences"), you MUST follow it precisely.\n';
+
+        const orchestratorMessages = [
+          {
+            role: 'system',
+            content: orchestratorSystem
+          },
+          {
+            role: 'user',
+            content:
+              `User request:\n${text}\n\n` +
+              `Internal panel notes from experts (not visible to user):\n${meetingTranscript}\n\n` +
+              `Now write the FINAL answer for the user, following their instructions exactly.`
+          }
+        ];
+
+        const finalReply = await callOllama(orchestratorMessages);
+
+        messages.push({ role: 'assistant', content: finalReply });
+        addMessage('assistant', finalReply);
+
+      } catch (err) {
+        addMessage('assistant', 'Request failed: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    // Auto-save when user edits system, roles, or agent count
+    systemEl.addEventListener('input', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_SYSTEM, systemEl.value);
+      } catch (e) {
+        console.warn('Could not save system prompt:', e);
+      }
+    });
+
+    rolesEl.addEventListener('input', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_ROLES, rolesEl.value);
+      } catch (e) {
+        console.warn('Could not save roles:', e);
+      }
+    });
+
+    agentCountEl.addEventListener('change', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_AGENT_COUNT, agentCountEl.value);
+      } catch (e) {
+        console.warn('Could not save agent count:', e);
+      }
+    });
+
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>

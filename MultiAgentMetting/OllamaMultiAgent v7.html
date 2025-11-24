@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ollama Multi-Agent Chat – Collaborative Soldiers</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 20px auto; }
+    #chat { border: 1px solid #444; padding: 10px; height: 420px; overflow-y: auto; white-space: pre-wrap; }
+    .msg-user { font-weight: bold; margin-bottom: 4px; }
+    .msg-assistant { color: #0a0; margin-bottom: 4px; }
+    .msg-final-reply { color: #0066cc; font-weight: 500; margin-bottom: 4px; }
+    .msg-meta { color: #666; font-style: italic; margin-bottom: 4px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button { margin-top: 8px; }
+    label { display: block; margin: 8px 0; }
+    input[type="number"] { width: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Ollama Multi-Agent Chat</h1>
+
+  <label>
+    System prompt (optional, global for everyone & the orchestrator):
+    <textarea id="system" rows="2" placeholder="You are a helpful assistant."></textarea>
+  </label>
+
+  <label>
+    Team roles (one per line, format: Name or Name: description):
+    <textarea id="roles" rows="4" placeholder="Machine learning expert
+GPT models expert
+Genetic Algorithms Expert"></textarea>
+  </label>
+
+  <label>
+    Number of assistants in the meeting (1–8):
+    <input id="agentCount" type="number" min="1" max="8" value="3" />
+  </label>
+
+  <div id="chat"></div>
+
+  <label>
+    Your message:
+    <textarea id="input" rows="3" placeholder="Type a message..."></textarea>
+  </label>
+  <button id="sendBtn">Send</button>
+  <button id="newChatBtn" style="margin-left: 10px;">New Chat</button>
+
+  <script>
+    // -------- CONFIG --------
+    const API_URL = 'http://localhost:11434/api/chat'; // your Ollama API
+    const MODEL   = 'deepseek-r1:8b';                  // model name
+
+    const SHOW_PANEL_NOTES = true; // show agents' notes in UI
+
+    // -------- DOM --------
+    const chatDiv      = document.getElementById('chat');
+    const inputEl      = document.getElementById('input');
+    const systemEl     = document.getElementById('system');
+    const rolesEl      = document.getElementById('roles');
+    const sendBtn      = document.getElementById('sendBtn');
+    const agentCountEl = document.getElementById('agentCount');
+    const newChatBtn   = document.getElementById('newChatBtn');
+
+    // -------- STATE --------
+    // History of user/orchestrator messages
+    const messages = []; // { role: 'user'|'assistant', content: string }
+    // History of all agent notes by round
+    const allAgentResponses = []; // { round, agentName, text }
+
+    // localStorage keys
+    const STORAGE_KEY_SYSTEM      = 'ollama_multi_agent_system_v3';
+    const STORAGE_KEY_ROLES       = 'ollama_multi_agent_roles_v3';
+    const STORAGE_KEY_AGENT_COUNT = 'ollama_multi_agent_agent_count_v3';
+
+    // -------- LOAD SAVED SETTINGS --------
+    (function loadSavedSettings() {
+      try {
+        const savedSystem = localStorage.getItem(STORAGE_KEY_SYSTEM);
+        const savedRoles  = localStorage.getItem(STORAGE_KEY_ROLES);
+        const savedCount  = localStorage.getItem(STORAGE_KEY_AGENT_COUNT);
+
+        if (savedSystem !== null) systemEl.value = savedSystem;
+        if (savedRoles  !== null) rolesEl.value  = savedRoles;
+        if (savedCount  !== null) agentCountEl.value = savedCount;
+      } catch (e) {
+        console.warn('Could not load saved settings:', e);
+      }
+    })();
+
+    // -------- ROLE / AGENT HELPERS --------
+    const AGENT_SYSTEM_PROMPTS = {
+      'Architect': 'You think in structure, steps, and frameworks. You design clear, step-by-step solutions.',
+      'Skeptic': 'You look for flaws, missing info, and risks. You point out what will break or confuse the user.',
+      'Pragmatist': 'You focus on simple, practical, shippable solutions. You remove bloat and keep what matters.',
+      'Researcher': 'You recall patterns, best practices, and references relevant to the current question.'
+      // You can add more short templates here if you like.
+    };
+
+    const DEFAULT_AGENT_TEMPLATES = [
+      { name: 'Architect',  system: AGENT_SYSTEM_PROMPTS['Architect'] },
+      { name: 'Skeptic',    system: AGENT_SYSTEM_PROMPTS['Skeptic'] },
+      { name: 'Pragmatist', system: AGENT_SYSTEM_PROMPTS['Pragmatist'] },
+      { name: 'Researcher', system: AGENT_SYSTEM_PROMPTS['Researcher'] }
+    ];
+
+    function clampAgentsCount(raw) {
+      let n = parseInt(raw, 10);
+      if (isNaN(n)) n = 1;
+      n = Math.max(1, Math.min(8, n));
+      return n;
+    }
+
+    function buildAgentsFromRolesText(n) {
+      const text = rolesEl.value.trim();
+      if (!text) {
+        return DEFAULT_AGENT_TEMPLATES.slice(0, n).map(a => ({
+          name: a.name,
+          system: a.system
+        }));
+      }
+
+      const lines = text.split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      const agents = [];
+      for (let i = 0; i < lines.length && agents.length < n; i++) {
+        const line = lines[i];
+        const parts = line.split(':');
+        const namePart = (parts[0] || '').trim();
+        const descPart = parts.slice(1).join(':').trim();
+
+        const name = namePart || `Agent ${agents.length + 1}`;
+
+        let systemPrompt;
+        if (AGENT_SYSTEM_PROMPTS[name]) {
+          systemPrompt = AGENT_SYSTEM_PROMPTS[name];
+        } else if (descPart) {
+          systemPrompt = descPart;
+        } else {
+          systemPrompt = `Act as ${name}, a capable specialist. Answer concisely and follow instructions exactly.`;
+        }
+
+        agents.push({ name, system: systemPrompt });
+      }
+
+      // pad if fewer lines than n
+      while (agents.length < n) {
+        const idx = agents.length + 1;
+        agents.push({
+          name: `Agent ${idx}`,
+          system: `Act as Agent ${idx}, a disciplined assistant who obeys instructions exactly and answers concisely.`
+        });
+      }
+
+      return agents;
+    }
+
+    function getActiveAgents() {
+      const n = clampAgentsCount(agentCountEl.value);
+      return buildAgentsFromRolesText(n);
+    }
+
+    // -------- UI HELPERS --------
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      if (role === 'meta') {
+        div.className = 'msg-meta';
+        div.textContent = content;
+      } else {
+        div.className = 'msg-' + role;
+        div.textContent = (role === 'user' ? 'You: ' : 'Bot: ') + content;
+      }
+      chatDiv.appendChild(div);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    async function callOllama(chatMessages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          stream: false
+        })
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      return data.message?.content || '(no content)';
+    }
+
+    // -------- CORE LOGIC: WHO SHOULD SPEAK? --------
+    function computeWhoShouldRespond(userText, agents) {
+      const text = userText.toLowerCase();
+
+      const everyonePatterns = /\b(everyone|all agents|all of you|you all|each of you|each agent)\b/;
+      const orchestratorPatterns = /\b(orchestrator|facilitator)\b/;
+
+      const forEveryone = everyonePatterns.test(text);
+      const toOrchestratorOnly = orchestratorPatterns.test(text) &&
+        !/\bagent\b/.test(text) &&
+        !everyonePatterns.test(text);
+
+      // Numbers like "agent 1", "agent 2"...
+      const numberMatches = Array.from(text.matchAll(/\bagent\s*(\d+)\b/g));
+      const addressedNumbers = numberMatches.map(m => parseInt(m[1], 10)).filter(n => !isNaN(n));
+
+      const directByName = new Set();
+      for (let i = 0; i < agents.length; i++) {
+        const nameLower = agents[i].name.toLowerCase();
+        if (nameLower && text.includes(nameLower)) {
+          directByName.add(i);
+        }
+      }
+
+      const shouldRespond = new Array(agents.length).fill(false);
+
+      if (toOrchestratorOnly) {
+        // no agent responds, orchestrator only
+        return shouldRespond;
+      }
+
+      if (forEveryone) {
+        for (let i = 0; i < agents.length; i++) shouldRespond[i] = true;
+      }
+
+      if (addressedNumbers.length > 0) {
+        addressedNumbers.forEach(num => {
+          const idx = num - 1;
+          if (idx >= 0 && idx < agents.length) shouldRespond[idx] = true;
+        });
+      }
+
+      if (directByName.size > 0) {
+        directByName.forEach(i => { shouldRespond[i] = true; });
+      }
+
+      // If nothing explicit is found, let everyone respond for broad questions
+      const any = shouldRespond.some(x => x);
+      if (!any && !toOrchestratorOnly) {
+        for (let i = 0; i < agents.length; i++) shouldRespond[i] = true;
+      }
+
+      return shouldRespond;
+    }
+
+    // -------- SEND MESSAGE FLOW --------
+    async function sendMessage() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      // Show user message
+      messages.push({ role: 'user', content: text });
+      addMessage('user', text);
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      const agents = getActiveAgents();
+      const globalSystem = systemEl.value.trim();
+
+      const agentReplies = [];
+      let panelTranscript = '';
+      const currentRound = messages.filter(m => m.role === 'user').length - 1;
+
+      try {
+        const shouldRespond = computeWhoShouldRespond(text, agents);
+
+        // Build a compact history string (for agents)
+        const historyForAgents = messages.map(m => {
+          const prefix = (m.role === 'user') ? 'User: ' : 'Orchestrator: ';
+          return prefix + m.content;
+        }).join('\n');
+
+        // 1) Run agents that should speak
+        for (let i = 0; i < agents.length; i++) {
+          const agent = agents[i];
+          const agentIndex = i + 1;
+
+          if (!shouldRespond[i]) {
+            // Skip calling the model entirely -> true silence
+            continue;
+          }
+
+          addMessage('meta', `[${agent.name} is thinking...]`);
+
+          const agentMessages = [];
+
+          if (globalSystem) {
+            agentMessages.push({
+              role: 'system',
+              content: globalSystem
+            });
+          }
+
+          // --- Build agent-specific job prompt (NO hardcoded content/writing tasks) ---
+          const agentIdentityPrompt =
+            `You are Agent ${agentIndex} named "${agent.name}" in a multi-agent team.\n` +
+            `Your specialization: ${agent.system}\n` +
+            `Always follow user instructions as your only task. Stay in character relevant to your specialty, and NEVER restate your role or the user's request, unless explicitly asked.\n` +
+            `If the user message is a greeting ("hi", "hello", etc.), respond only briefly, or keep silent as appropriate.\n` +
+            `Your output must answer ONLY what the user asked for, and nothing else.\n`;
+
+          // Build "this round so far" context
+          const thisRoundContext = panelTranscript
+            ? `Notes from other agents in this round:\n${panelTranscript}\n`
+            : `No other agent has spoken yet in this round.\n`;
+
+          const fullPrompt =
+            agentIdentityPrompt +
+            `Conversation history:\n${historyForAgents}\n\n` +
+            thisRoundContext +
+            `Current user message (treat as orders):\n"${text}"\n\n` +
+            `Obey the user’s instruction literally, and do not do more than asked.`;
+
+          agentMessages.push({ role: 'system', content: fullPrompt });
+
+          // Basic "user" message to kick the chat
+          agentMessages.push({
+            role: 'user',
+            content: `Respond now with your internal note for this turn.`
+          });
+
+          let reply;
+          try {
+            reply = await callOllama(agentMessages);
+            if (reply) reply = reply.trim();
+          } catch (err) {
+            reply = `Error from ${agent.name}: ${err.message}`;
+          }
+
+          agentReplies.push({ agentName: agent.name, text: reply });
+
+          // Save in history so future rounds know what happened
+          allAgentResponses.push({
+            round: currentRound,
+            agentName: agent.name,
+            text: reply
+          });
+
+          if (SHOW_PANEL_NOTES) {
+            addMessage('assistant', `${agent.name} (notes):\n${filterAgentOutput(reply)}`);
+          }
+
+          // Accumulate for later agents in this same round
+          panelTranscript += `${agent.name} notes:\n${reply}\n\n`;
+        }
+
+        // 2) Orchestrator composes final reply
+        const meetingTranscript = panelTranscript.trim() ||
+          agentReplies.map(ar => `${ar.agentName} notes:\n${ar.text}`).join('\n\n---\n\n');
+
+        const orchestratorMessages = [];
+
+        const orchestratorSystem =
+          (globalSystem ? globalSystem + '\n\n' : '') +
+          `You are the Orchestrator of a team of agents.\n` +
+          `Only YOUR output is shown to the user.\n\n` +
+          `Your job:\n` +
+          `- Read the user message and the internal notes from the agents.\n` +
+          `- Present the result in a clear, concise way.\n` +
+          `- Do NOT repeat the full notes verbatim unless the user clearly wants that.\n` +
+          `- If the user asked something like "everyone give me a number", show clearly which agent produced which number.\n` +
+          `- If the user addressed only one agent, focus on that agent's response.\n` +
+          `- Treat the agents like soldiers who followed orders; you are the officer summarizing what happened.\n` +
+          `- Match the level of detail to how complex the user’s request is.\n`;
+
+        orchestratorMessages.push({ role: 'system', content: orchestratorSystem });
+
+        // Add conversation history
+        for (const msg of messages) {
+          orchestratorMessages.push({ role: msg.role, content: msg.content });
+        }
+
+        const agentsList = agents.map((a, idx) => `Agent ${idx + 1}: ${a.name}`).join('\n');
+
+        const orchestratorPrompt =
+          `User's latest message:\n"${text}"\n\n` +
+          `Team composition:\n${agentsList}\n\n` +
+          `Internal notes from agents in this round:\n${meetingTranscript}\n\n` +
+          `Now respond to the user.\n`;
+
+        orchestratorMessages.push({ role: 'user', content: orchestratorPrompt });
+
+        const finalReply = await callOllama(orchestratorMessages);
+
+        messages.push({ role: 'assistant', content: finalReply });
+        const div = document.createElement('div');
+        div.className = 'msg-final-reply';
+        div.textContent = 'Bot: ' + finalReply;
+        chatDiv.appendChild(div);
+        chatDiv.scrollTop = chatDiv.scrollHeight;
+
+      } catch (err) {
+        addMessage('assistant', 'Request failed: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    // NEW CHAT HANDLER: Reset conversation state and UI
+    newChatBtn.addEventListener('click', () => {
+      messages.length = 0; // Clear all message history
+      chatDiv.innerHTML = '';
+      inputEl.value = '';
+    });
+
+    // -------- AUTOSAVE --------
+    systemEl.addEventListener('input', () => {
+      try { localStorage.setItem(STORAGE_KEY_SYSTEM, systemEl.value); } catch (e) {}
+    });
+    rolesEl.addEventListener('input', () => {
+      try { localStorage.setItem(STORAGE_KEY_ROLES, rolesEl.value); } catch (e) {}
+    });
+    agentCountEl.addEventListener('change', () => {
+      try { localStorage.setItem(STORAGE_KEY_AGENT_COUNT, agentCountEl.value); } catch (e) {}
+    });
+
+    // -------- EVENT HANDLERS --------
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    // --- Utility: filter repetitive agent output before displaying ---
+    function filterAgentOutput(text) {
+      // Strip lines starting with 'User request:', 'My task:', 'Internal Note:' or formulaic setup
+      return text.replace(/^(User request:|My task:|\\*\\*Internal Note:\\*\\*|Output as .*?:|As (an?|the) .*?,? )(.|\n)*?\n/gi, '')
+        .replace(/^I will .*?\n/gi, '')
+        .replace(/\n\n+/g, '\n').trim();
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ollama Multi-Agent Chat</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 20px auto; }
+    #chat { border: 1px solid #444; padding: 10px; height: 400px; overflow-y: auto; white-space: pre-wrap; }
+    .msg-user { font-weight: bold; margin-bottom: 4px; }
+    .msg-assistant { color: #0a0; margin-bottom: 4px; }
+    .msg-final-reply { color: #0066cc; font-weight: 500; margin-bottom: 4px; }
+    .msg-meta { color: #666; font-style: italic; margin-bottom: 4px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button { margin-top: 8px; }
+    label { display: block; margin: 8px 0; }
+    input[type="number"] { width: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Ollama Multi-Agent Chat</h1>
+
+  <label>
+    System prompt (optional, global for everyone & the orchestrator):
+    <textarea id="system" rows="2" placeholder="You are a helpful assistant."></textarea>
+  </label>
+
+  <label>
+    Team roles (one per line, format: Name or Name: description):
+    <textarea id="roles" rows="4" placeholder="Architect
+Skeptic
+Tarentino style Movie Writer
+Netflix TV Series Writer"></textarea>
+  </label>
+
+  <label>
+    Number of assistants in the meeting (1–8):
+    <input id="agentCount" type="number" min="1" max="8" value="3" />
+  </label>
+
+  <div id="chat"></div>
+
+  <label>
+    Your message:
+    <textarea id="input" rows="3" placeholder="Type a message..."></textarea>
+  </label>
+  <button id="sendBtn">Send</button>
+
+  <script>
+    const API_URL = 'http://localhost:11434/api/chat'; // local Ollama API
+    const MODEL   = 'deepseek-r1:8b';                  // change to whatever you pulled
+
+    const chatDiv      = document.getElementById('chat');
+    const inputEl      = document.getElementById('input');
+    const systemEl     = document.getElementById('system');
+    const rolesEl      = document.getElementById('roles');
+    const sendBtn      = document.getElementById('sendBtn');
+    const agentCountEl = document.getElementById('agentCount');
+
+    // Toggle this to hide/show the panel notes in the UI
+    const SHOW_PANEL_NOTES = true;
+
+    // Full conversation history including user messages, agent notes, and orchestrator replies
+    const messages = [];
+    // Store all agent responses from all rounds for full context awareness
+    const allAgentResponses = []; // Format: { round: number, agentName: string, text: string }
+
+    // NEW localStorage keys (v2 so we don't load old Hardcore Survival prompts)
+    const STORAGE_KEY_SYSTEM      = 'ollama_multi_agent_system_v2';
+    const STORAGE_KEY_ROLES       = 'ollama_multi_agent_roles_v2';
+    const STORAGE_KEY_AGENT_COUNT = 'ollama_multi_agent_agent_count_v2';
+
+    // Load saved settings on startup
+    (function loadSavedSettings() {
+      try {
+        const savedSystem = localStorage.getItem(STORAGE_KEY_SYSTEM);
+        const savedRoles  = localStorage.getItem(STORAGE_KEY_ROLES);
+        const savedCount  = localStorage.getItem(STORAGE_KEY_AGENT_COUNT);
+
+        if (savedSystem !== null) {
+          systemEl.value = savedSystem;
+        }
+
+        if (savedRoles !== null) {
+          rolesEl.value = savedRoles;
+        }
+
+        if (savedCount !== null) {
+          agentCountEl.value = savedCount;
+        }
+      } catch (e) {
+        console.warn('Could not load saved settings:', e);
+      }
+    })();
+
+    // Agent system prompts mapped by name - agents pick their prompt from their name
+    const AGENT_SYSTEM_PROMPTS = {
+      'Architect': 'You think in structure, steps, and frameworks. You design clear, step-by-step solutions.',
+      'Skeptic': 'You look for flaws, missing info, and risks. You point out what will break or confuse the user.',
+      'Pragmatist': 'You focus on simple, practical, shippable solutions. You remove bloat and keep what matters.',
+      'Researcher': 'You recall patterns, best practices, and references relevant to the current question.',
+      'Tarentino style Movie Writer': 'You are a creative writer specializing in Tarantino-style dialogue, nonlinear narratives, and cinematic storytelling. Focus on sharp dialogue, unexpected twists, and pop culture references.',
+      'Tarantino style Movie Writer': 'You are a creative writer specializing in Tarantino-style dialogue, nonlinear narratives, and cinematic storytelling. Focus on sharp dialogue, unexpected twists, and pop culture references.',
+      'Netflix TV Series Writer': 'You are a TV series writer who understands pacing, character arcs, and episodic storytelling. Focus on binge-worthy content, cliffhangers, and character development.',
+      'Game Development Assistant': 'You are a game development expert who understands game mechanics, player experience, and technical implementation. Focus on gameplay, balance, and engaging player interactions.'
+    };
+
+    // Role-specific scope instructions - defines what each agent should focus on and avoid
+    function getRoleScope(agentName, agentSystem) {
+      const nameLower = agentName.toLowerCase();
+      const systemLower = agentSystem.toLowerCase();
+      const combined = nameLower + ' ' + systemLower;
+
+      // Writing-focused roles (screenwriter, writer, novelist, etc.)
+      if (combined.match(/\b(writer|screenwriter|novelist|author|script|dialogue|narrative|story|tarantino|cinematic|tv series|movie|film|screenplay)\b/)) {
+        return {
+          focus: [
+            'Dialogue quality, character voice, and authenticity',
+            'Narrative structure, pacing, and story beats',
+            'Writing style, tone, and voice',
+            'Character development and arcs',
+            'Scene construction and dramatic tension',
+            'Dialogue that reveals character and advances plot',
+            'Writing techniques and literary devices'
+          ],
+          avoid: [
+            'Technical implementation details',
+            'Code or programming',
+            'Game mechanics or system design',
+            'Business strategy or marketing',
+            'Technical architecture or infrastructure'
+          ],
+          examples: 'If asked about a story, suggest dialogue improvements, character motivations, or narrative structure. If asked about coding or game design, acknowledge it\'s outside your expertise and focus only on any writing/narrative aspects.'
+        };
+      }
+
+      // Game development roles
+      if (combined.match(/\b(game|gaming|gameplay|game design|game mechanics|player experience|game development|game dev)\b/)) {
+        return {
+          focus: [
+            'Game mechanics and systems',
+            'Player experience and engagement',
+            'Gameplay loops and progression',
+            'Balance and difficulty curves',
+            'Game design principles',
+            'Player psychology and motivation',
+            'Technical game implementation'
+          ],
+          avoid: [
+            'Creative writing or dialogue',
+            'Screenwriting or film structure',
+            'Business strategy unrelated to games',
+            'Literary analysis'
+          ],
+          examples: 'If asked about game design, suggest mechanics, balance, or player experience improvements. If asked about writing dialogue, focus only on how it serves gameplay or player engagement.'
+        };
+      }
+
+      // Technical/Programming roles
+      if (combined.match(/\b(programmer|developer|coder|software|code|programming|technical|engineer|architect|system design|api|algorithm)\b/)) {
+        return {
+          focus: [
+            'Code structure and architecture',
+            'Technical implementation',
+            'Best practices and patterns',
+            'Performance and optimization',
+            'System design and scalability',
+            'API design and interfaces',
+            'Debugging and error handling'
+          ],
+          avoid: [
+            'Creative writing or dialogue',
+            'Game design mechanics',
+            'Business strategy',
+            'Literary or narrative analysis'
+          ],
+          examples: 'If asked about coding, suggest technical solutions, patterns, or architecture. If asked about writing or game design, acknowledge it\'s outside your technical expertise.'
+        };
+      }
+
+      // Business/Strategy roles
+      if (combined.match(/\b(business|strategy|marketing|product|manager|executive|consultant|analyst)\b/)) {
+        return {
+          focus: [
+            'Business strategy and planning',
+            'Market analysis and positioning',
+            'Product development and features',
+            'User needs and market fit',
+            'ROI and business metrics',
+            'Go-to-market strategies'
+          ],
+          avoid: [
+            'Technical code implementation',
+            'Creative writing details',
+            'Game mechanics specifics'
+          ],
+          examples: 'If asked about business, suggest strategic approaches, market considerations, or product decisions. If asked about technical details, focus on business impact rather than implementation.'
+        };
+      }
+
+      // Generic/General roles (default)
+      return {
+        focus: [
+          'Your specific domain expertise',
+          'Practical and actionable suggestions',
+          'Critical analysis and improvements',
+          'Best practices in your field'
+        ],
+        avoid: [
+          'Areas clearly outside your expertise',
+          'Topics unrelated to your specialization'
+        ],
+        examples: 'Focus on your area of expertise. If the question is outside your domain, acknowledge it and focus only on aspects that relate to your specialization.'
+      };
+    }
+
+    // Default templates if no custom roles are given
+    const DEFAULT_AGENT_TEMPLATES = [
+      { name: 'Architect', system: AGENT_SYSTEM_PROMPTS['Architect'] },
+      { name: 'Skeptic', system: AGENT_SYSTEM_PROMPTS['Skeptic'] },
+      { name: 'Pragmatist', system: AGENT_SYSTEM_PROMPTS['Pragmatist'] },
+      { name: 'Researcher', system: AGENT_SYSTEM_PROMPTS['Researcher'] }
+    ];
+
+    function clampAgentsCount(raw) {
+      let n = parseInt(raw, 10);
+      if (isNaN(n)) n = 1;
+      n = Math.max(1, n);
+      n = Math.min(8, n);
+      return n;
+    }
+
+    function buildAgentsFromRolesText(n) {
+      const text = rolesEl.value.trim();
+      if (!text) {
+        // Fall back to defaults
+        return DEFAULT_AGENT_TEMPLATES
+          .slice(0, n)
+          .map(a => ({ name: a.name, system: a.system }));
+      }
+
+      const lines = text.split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      const agents = [];
+
+      for (let i = 0; i < lines.length && agents.length < n; i++) {
+        const line = lines[i];
+        const parts = line.split(':');
+        const namePart = (parts[0] || '').trim();
+        const descPart = parts.slice(1).join(':').trim();
+
+        const name = namePart || `Agent ${agents.length + 1}`;
+
+        let systemPrompt;
+        // First, try to get system prompt from name mapping
+        if (AGENT_SYSTEM_PROMPTS[name]) {
+          systemPrompt = AGENT_SYSTEM_PROMPTS[name];
+        } else if (descPart) {
+          // If not found in mapping but description provided, use description
+          systemPrompt = descPart;
+        } else {
+          // If user only wrote a name (not in mapping), generate default
+          systemPrompt = `Act as ${name}, a highly capable specialist. Provide high-quality ideas, critiques, and improvements in your domain.`;
+        }
+
+        agents.push({
+          name,
+          system: systemPrompt
+        });
+      }
+
+      // If fewer lines than n, pad with generic agents
+      while (agents.length < n) {
+        const idx = agents.length + 1;
+        agents.push({
+          name: `Agent ${idx}`,
+          system: `Act as Agent ${idx}, an expert assistant. Provide sharp, concrete suggestions and critiques.`
+        });
+      }
+
+      return agents;
+    }
+
+    function getActiveAgents() {
+      const n = clampAgentsCount(agentCountEl.value);
+      return buildAgentsFromRolesText(n);
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      if (role === 'meta') {
+        div.className = 'msg-meta';
+        div.textContent = content;
+      } else {
+        div.className = 'msg-' + role;
+        div.textContent = (role === 'user' ? 'You: ' : 'Bot: ') + content;
+      }
+      chatDiv.appendChild(div);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    async function callOllama(chatMessages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          stream: false
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('HTTP ' + res.status);
+      }
+
+      const data = await res.json();
+      return data.message?.content || '(no content)';
+    }
+
+    async function sendMessage() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      // Show user message in UI
+      messages.push({ role: 'user', content: text });
+      addMessage('user', text);
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      const agents = getActiveAgents();
+      const globalSystem = systemEl.value.trim();
+
+      const agentReplies = [];
+      let panelTranscript = ''; // all expert notes so far
+      // Calculate current round (0-indexed: first round is 0, second is 1, etc.)
+      const currentRound = messages.filter(m => m.role === 'user').length - 1;
+
+      try {
+        // 1) Run each assistant sequentially as a PANEL of INTERNAL EXPERTS
+        for (const agent of agents) {
+          addMessage('meta', `[${agent.name} is thinking...]`);
+
+          const agentMessages = [];
+
+          if (globalSystem) {
+            agentMessages.push({
+              role: 'system',
+              content: globalSystem
+            });
+          }
+
+          // Get role-specific scope
+          const roleScope = getRoleScope(agent.name, agent.system);
+          const focusList = roleScope.focus.map(f => `• ${f}`).join('\n');
+          const avoidList = roleScope.avoid.map(a => `• ${a}`).join('\n');
+
+          // Check if this agent is told to stay silent
+          const agentNameLower = agent.name.toLowerCase();
+          const textLower = text.toLowerCase();
+          
+          // Check if user is addressing orchestrator only (agents should stay silent)
+          const addressingOrchestrator = /\b(orchestrator|orchestrate|facilitator|you\s+(analyze|tell|say|respond|answer|explain|summarize))\b/i.test(text) && 
+            !/\b(agent|agents|team|everyone|all|guys|guys|you all)\b/i.test(text);
+          
+          // Check for explicit "do not talk" or "don't talk" commands
+          const doNotTalkPatterns = [
+            /\b(do\s+not\s+talk|don'?t\s+talk|no\s+talking|stop\s+talking|be\s+quiet|stay\s+silent|don'?t\s+respond|do\s+not\s+respond)\b/i,
+            /\b(agents?\s+(do\s+not|don'?t|should\s+not|must\s+not)\s+(talk|speak|respond|say|answer))\b/i,
+            /\b(all\s+agents?\s+(do\s+not|don'?t|should\s+not|must\s+not|stay|remain|keep|be)\s+(silent|quiet|mute))\b/i
+          ];
+          const shouldNotTalk = doNotTalkPatterns.some(pattern => pattern.test(textLower));
+          
+          // Check for patterns like "agent name stay silent", "agent name don't respond", etc.
+          const staySilentPatterns = [
+            new RegExp(`\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(stay|remain|keep|be)\\s+(silent|quiet|mute)`, 'i'),
+            new RegExp(`\\b(stay|remain|keep|be)\\s+(silent|quiet|mute).*\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+            new RegExp(`\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(don'?t|do not|should not|must not)\\s+(respond|speak|talk|say|answer)`, 'i'),
+            new RegExp(`\\b(don'?t|do not|should not|must not)\\s+(let|have|allow).*\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b.*(respond|speak|talk|say|answer)`, 'i')
+          ];
+          const shouldStaySilent = shouldNotTalk || addressingOrchestrator || staySilentPatterns.some(pattern => pattern.test(textLower));
+          
+          // Check if this agent is being addressed directly
+          const agentNameWords = agentNameLower.split(/\s+/);
+          const isAddressed = agentNameWords.some(word => {
+            const wordPattern = new RegExp(`\\b${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+            return wordPattern.test(textLower);
+          });
+
+          // Build list of all agents in the meeting for context
+          const allAgentNames = agents.map((a, idx) => `${idx + 1}. ${a.name}`).join('\n');
+          const agentIndex = agents.findIndex(a => a.name === agent.name) + 1;
+
+          // Role for this agent as an internal note-generator with role-specific scope
+          agentMessages.push({
+            role: 'system',
+            content:
+              `=== YOUR IDENTITY - CRITICAL ===\n` +
+              `You are Agent ${agentIndex}: ${agent.name}\n` +
+              `Your role: ${agent.system}\n` +
+              `You are NOT the orchestrator. You are NOT the user. You are Agent ${agentIndex} (${agent.name}).\n` +
+              `Remember: You are ${agent.name}, and your expertise is: ${agent.system}\n\n` +
+              `=== MEETING PARTICIPANTS ===\n` +
+              `You are in a meeting with ${agents.length} team members:\n${allAgentNames}\n\n` +
+              `=== YOUR SPECIALIZATION ===\n` +
+              `FOCUS ON:\n${focusList}\n\n` +
+              `AVOID:\n${avoidList}\n\n` +
+              `EXAMPLES: ${roleScope.examples}\n\n` +
+              `=== CRITICAL BEHAVIOR RULES ===\n` +
+              `• You are Agent ${agentIndex} (${agent.name}). Always remember who you are.\n` +
+              `• You are participating in a COLLABORATIVE team meeting. You can see what ALL other team members have typed.\n` +
+              `• Before you respond, ALWAYS check what other team members said in the current round (shown below).\n` +
+              `• NEVER say "Hi", "Hello", or greetings unless the user explicitly greets you first with a greeting.\n` +
+              `• NEVER start with "Alright team" or similar phrases - just respond directly to the task.\n` +
+              `• If the user addresses the orchestrator (e.g., "orchestrator analyze..."), you MUST stay silent.\n` +
+              `• If the user says "do not talk", "don't talk", "stay silent", or similar, you MUST stay completely silent.\n` +
+              `• COLLABORATION IS MANDATORY: You must actively engage with other agents' ideas, not just acknowledge them.\n` +
+              `• When other agents have already responded, you MUST:\n` +
+              `  - Critically evaluate their suggestions (identify strengths, weaknesses, gaps)\n` +
+              `  - Build on specific points they raised (expand, refine, or combine ideas)\n` +
+              `  - Challenge assumptions when appropriate (point out contradictions or risks)\n` +
+              `  - Synthesize ideas together (show how different perspectives connect)\n` +
+              `  - Reference specific points from their responses (don't just say "I agree")\n` +
+              `  - AVOID REPETITION: If another agent already said something, don't repeat it - build on it or challenge it\n` +
+              `• If the user asks you to do something based on another agent's response, find that agent's response and use it.\n` +
+              `• Act like a REAL HUMAN in a meeting. For simple tasks, just do them without unnecessary commentary.\n` +
+              `• IMPORTANT: You have full visibility into what everyone else typed. Use this information to COLLABORATE, not just observe.`
+          });
+
+          // Build full conversation history including all previous agent responses
+          // First, include user messages and orchestrator final replies
+          for (let i = 0; i < messages.length - 1; i++) {
+            const msg = messages[i];
+            agentMessages.push({
+              role: msg.role,
+              content: msg.content
+            });
+          }
+
+          // Now include all previous agent responses from all previous rounds
+          if (allAgentResponses.length > 0) {
+            // Group agent responses by round for better context
+            const responsesByRound = {};
+            for (const response of allAgentResponses) {
+              if (!responsesByRound[response.round]) {
+                responsesByRound[response.round] = [];
+              }
+              responsesByRound[response.round].push(response);
+            }
+
+            // Add previous agent responses as context
+            let previousAgentsContext = '';
+            for (let round = 0; round < currentRound; round++) {
+              if (responsesByRound[round] && responsesByRound[round].length > 0) {
+                previousAgentsContext += `\n=== Round ${round + 1} - Team Member Notes ===\n`;
+                for (const response of responsesByRound[round]) {
+                  previousAgentsContext += `${response.agentName} notes:\n${response.text}\n\n`;
+                }
+              }
+            }
+
+            if (previousAgentsContext) {
+              // Add previous agent responses as a user message for context
+              agentMessages.push({
+                role: 'user',
+                content: `=== FULL MEETING HISTORY - Previous Team Member Responses ===${previousAgentsContext}\n` +
+                  `This is what other team members said in previous rounds. Use this context to understand the full conversation.`
+              });
+            }
+          }
+
+          // Build panel-style user prompt for this agent (current round responses)
+          const panelContext = panelTranscript
+            ? `Here are notes from other team members in THIS round so far:\n\n${panelTranscript}\n\n`
+            : '';
+
+          // Check if user is asking for a number
+          const askingForNumber = /\b(number|random|digit|value|num|invent.*number|pick.*number)\b/i.test(text);
+          
+          // Detect if this is a simple greeting or minimal context
+          const isSimpleGreeting = /^(hi|hello|hey|greetings|good (morning|afternoon|evening))[\s!.,]*$/i.test(text.trim());
+          const isMinimalContext = text.trim().length < 20 && !/\?/.test(text);
+          
+          // Detect simple tasks that don't need expertise commentary
+          const isSimpleTask = askingForNumber || 
+            /\b(pick|choose|select|say|tell|state|give|provide).*(number|name|word|color|item)\b/i.test(text);
+          
+          // Detect if user is explicitly asking for collaboration
+          const askingForCollaboration = /\b(work as a team|collaborate|work together|team up|combine|synthesize|work collaboratively)\b/i.test(text);
+
+          // Build agent-specific instruction awareness
+          let agentIdentityPrompt = `=== YOUR IDENTITY IN THIS MEETING ===\n` +
+            `You are Agent ${agentIndex}: ${agent.name}\n` +
+            `You are one of ${agents.length} team members in this meeting.\n` +
+            `If the user addresses "agent ${agentIndex}" or "${agent.name}", they are talking to YOU.\n` +
+            `Follow their instructions exactly.\n\n`;
+          
+          if (shouldStaySilent) {
+            let reason = '';
+            if (addressingOrchestrator) {
+              reason = `The user is addressing the orchestrator, not the agents.`;
+            } else if (shouldNotTalk) {
+              reason = `The user explicitly told agents not to talk.`;
+            } else {
+              reason = `The user has explicitly told you (${agent.name}) to stay silent.`;
+            }
+            agentIdentityPrompt += `=== CRITICAL INSTRUCTION - STAY SILENT ===\n` +
+              `${reason}\n` +
+              `You MUST NOT respond. Do not provide any notes, numbers, commentary, or greetings.\n` +
+              `Do not say "Hi", "Hello", or anything else.\n` +
+              `Simply stay silent. Output ONLY: "[Staying silent as requested]"\n` +
+              `Do not add any explanation or additional text.\n`;
+          } else if (isAddressed && !isSimpleGreeting) {
+            agentIdentityPrompt += `=== YOU ARE BEING ADDRESSED ===\n` +
+              `The user's message appears to be addressing you (${agent.name}) specifically.\n` +
+              `Pay close attention to what they're asking you to do.\n\n`;
+          }
+
+          // Check if user is asking this agent to build on another agent's response
+          // Look for phrases like "add X to that", "use that number", "based on that", etc.
+          const buildingOnPatterns = [
+            /\b(add|subtract|multiply|divide|use|take|based on|from that|to that|with that|that number|that value|that result)\b/i,
+            /\b(add|subtract|multiply|divide)\s+\d+\s+to\s+(that|it|the number|the value)\b/i
+          ];
+          const isBuildingOnPrevious = buildingOnPatterns.some(pattern => pattern.test(text)) && 
+            (isAddressed || textLower.includes(agentNameLower) || textLower.includes('agent'));
+
+          // Extract numbers from panelContext to make them more visible
+          let numbersInContext = '';
+          if (panelContext) {
+            // Parse the panelContext format: "Agent Name notes:\nresponse\n\n"
+            const lines = panelContext.split('\n');
+            let currentAgent = '';
+            let foundNumbers = false;
+            
+            for (let i = 0; i < lines.length; i++) {
+              const line = lines[i].trim();
+              // Check if this line is an agent name with "notes:"
+              if (line.endsWith('notes:')) {
+                currentAgent = line.replace(/\s+notes:\s*$/, '').trim();
+              } else if (currentAgent && line) {
+                // This is the response content - look for numbers
+                const numMatch = line.match(/\b(\d+)\b/);
+                if (numMatch) {
+                  if (!foundNumbers) {
+                    numbersInContext = '\n=== NUMBERS FROM OTHER TEAM MEMBERS IN THIS ROUND ===\n';
+                    foundNumbers = true;
+                  }
+                  numbersInContext += `${currentAgent}: ${numMatch[1]}\n`;
+                  currentAgent = ''; // Reset after finding number
+                }
+              }
+            }
+            
+            if (foundNumbers) {
+              numbersInContext += '\n';
+            }
+          }
+
+          // Build agent number to name mapping for clarity
+          const agentMapping = agents.map((a, idx) => `Agent ${idx + 1} = ${a.name}`).join('\n');
+          
+          // Build a clearer prompt structure
+          let contextSection = '';
+          if (panelContext) {
+            contextSection = 
+              `\n${'='.repeat(60)}\n` +
+              `⚠️  CRITICAL: READ THIS FIRST - WHAT OTHERS TYPED IN THIS ROUND ⚠️\n` +
+              `${'='.repeat(60)}\n\n` +
+              `AGENT MAPPING (to help you understand who is who):\n${agentMapping}\n\n` +
+              `${panelContext}\n` +
+              (numbersInContext ? numbersInContext : '') +
+              `${'='.repeat(60)}\n` +
+              `END OF OTHER TEAM MEMBERS' RESPONSES\n` +
+              `${'='.repeat(60)}\n\n` +
+              `🚨 COLLABORATION REQUIREMENT 🚨\n` +
+              `The responses above show what other team members have ALREADY typed in this round.\n` +
+              `You MUST actively collaborate with their ideas:\n` +
+              `• Don't just acknowledge - ENGAGE with specific points they made\n` +
+              `• Build on their ideas, challenge weak points, identify gaps\n` +
+              `• Show how your perspective connects to or differs from theirs\n` +
+              `• Synthesize: combine ideas, find patterns, create new insights\n` +
+              `• Reference specific details from their responses (e.g., "Building on Agent 1's point about X...")\n` +
+              `• If you see contradictions or overlaps, address them directly\n` +
+              `• AVOID REPETITION: If another agent already covered a point, don't repeat it - either build on it, challenge it, or add a NEW perspective\n` +
+              `• NEVER say "Hi", "Hello", "Alright team", or similar greetings - just respond directly to the task\n` +
+              `• Think of this as a real brainstorming session where ideas evolve through discussion\n\n` +
+              `If the user says "agent 1", "agent 2", etc., use the mapping above to find which agent that is.\n` +
+              `If the user asks you to do something with "that number" or "add to that", look in the responses above.\n` +
+              `Find the agent's response and use their actual number.\n\n`;
+          } else {
+            // Even if no panel context yet, show the mapping
+            contextSection = 
+              `\nAGENT MAPPING (to help you understand who is who):\n${agentMapping}\n\n`;
+          }
+
+          const agentPrompt =
+            agentIdentityPrompt +
+            `=== USER'S CURRENT MESSAGE ===\n"${text}"\n\n` +
+            contextSection +
+            `=== YOUR TASK ===\n` +
+            (shouldStaySilent ?
+              `STAY SILENT. Do not respond. Do not say "Hi" or anything else.\n` +
+              `Output ONLY: "[Staying silent as requested]"\n` +
+              `Do not add any explanation, greeting, or additional text.` :
+              isSimpleGreeting ? 
+              `This is a simple greeting. Respond naturally like a human would in a meeting:\n` +
+              `• Just greet them back warmly and briefly (e.g., "Hi! How can I help?" or "Hello! Ready to work.")\n` +
+              `• Do NOT provide bullet points, detailed notes, or talk about your expertise.\n` +
+              `• Keep it conversational and human-like.\n` :
+              isSimpleTask ?
+              `This is a simple task request. Think carefully about what the user is asking:\n` +
+              (askingForNumber && !isBuildingOnPrevious ?
+                `• The user wants you (Agent ${agentIndex}, ${agent.name}) to provide a number.\n` +
+                `• Provide your number clearly (e.g., "7" or just "7")\n` +
+                `• Do NOT explain how this relates to your specialization.\n` +
+                `• Do NOT provide bullet points or detailed notes.\n` +
+                `• Just pick a number and state it. That's it.\n` :
+                isBuildingOnPrevious ?
+                `CRITICAL: The user is asking you (Agent ${agentIndex}, ${agent.name}) to perform an operation on another team member's response.\n\n` +
+                `READ THE RESPONSES ABOVE CAREFULLY. Here's what to do:\n\n` +
+                `1. Look in the "CRITICAL: READ THIS FIRST" section above for other agents' responses.\n` +
+                `2. The user's message is: "${text}"\n` +
+                `3. Find the FIRST agent mentioned in the user's message. For example:\n` +
+                `   - If user says "agent 1 give a number, agent 2 add 1 to that", find Agent 1's response\n` +
+                `   - Use the AGENT MAPPING shown above to know which agent name corresponds to which number\n` +
+                `4. Look for that agent's response in the "CRITICAL: READ THIS FIRST" section above\n` +
+                `5. Extract the NUMBER from that agent's response. Look for digits like "6", "8", "5", etc.\n` +
+                `6. Perform the operation: ${text.match(/\b(add|subtract|multiply|divide)\s+(\d+)\b/i) ? 
+                  `The user said "${text.match(/\b(add|subtract|multiply|divide)\s+(\d+)\b/i)[0]}". ` : ''}Do the math.\n` +
+                `7. Provide ONLY the result as a number (e.g., "7" or "9").\n\n` +
+                `Example: If the user says "agent 1 give a number, agent 2 add 1 to that":\n` +
+                `- Agent 1 (${agents[0]?.name || 'first agent'}) provides a number like "6"\n` +
+                `- You (Agent ${agentIndex}) see Agent 1's "6" in the responses above and respond: "7" (6+1)\n\n` +
+                `DO NOT say "I cannot find" unless you've carefully searched ALL the responses in the "CRITICAL: READ THIS FIRST" section above.\n` +
+                `The responses are clearly marked and shown above.\n` :
+                `• Do the task directly and briefly.\n` +
+                `• Do NOT provide extensive commentary about your expertise unless the task specifically requires it.\n` +
+                `• Act naturally - humans don't lecture about their job when doing simple tasks.\n`) :
+              isMinimalContext ?
+              `This is a brief message with minimal context. Respond naturally and concisely:\n` +
+              `• Address the user's message directly and briefly.\n` +
+              `• Only mention your expertise if it's actually relevant to what they're asking.\n` +
+              `• Do NOT provide extensive bullet points or detailed analysis yet.\n` +
+              `• Wait for more context before diving deep.\n` :
+              (askingForCollaboration && panelContext ?
+              `🔥 THE USER EXPLICITLY ASKED FOR TEAM COLLABORATION 🔥\n` +
+              `This is CRITICAL - you must work together as a unified team, not as independent agents.\n\n` +
+              `Your response MUST:\n` +
+              `1. SYNTHESIZE all ideas from other agents into a cohesive solution\n` +
+              `2. IDENTIFY the best parts of each agent's contribution and combine them\n` +
+              `3. FILL GAPS where one agent's idea needs another's expertise\n` +
+              `4. CREATE NEW INSIGHTS by connecting different perspectives\n` +
+              `5. REFERENCE SPECIFIC POINTS from other agents (e.g., "Building on Agent 1's framework, Agent 2's optimization approach, and Agent 3's safety considerations...")\n` +
+              `6. SHOW HOW ideas complement each other or where they conflict (and how to resolve conflicts)\n` +
+              `7. PRODUCE something USEFUL that none of you could create alone\n\n` +
+              `Think of this as a design sprint where you're combining everyone's expertise into one powerful solution.\n` +
+              `Don't just list what each agent said - show how their ideas WORK TOGETHER.\n` +
+              `Address the user's message, but make collaboration the PRIMARY focus of your response.\n` :
+              `The user has provided substantial context. Respond as a COLLABORATIVE team member:\n` +
+              `• Address the user's message directly first.\n` +
+              `• Pay attention to what other team members said in previous rounds (see meeting history above).\n` +
+              `• If the user asks you to build on another agent's response, use their actual response from the meeting history.\n` +
+              `\n🚨 MANDATORY COLLABORATION (if other agents have responded in this round):\n` +
+              `• You MUST engage with their ideas, not just acknowledge them:\n` +
+              `  - Quote or reference specific points they made (e.g., "Agent 1 mentioned X, and I think we can extend that by...")\n` +
+              `  - Build on their ideas: expand, refine, or combine them with your perspective\n` +
+              `  - Challenge weak points: identify gaps, contradictions, or risks they might have missed\n` +
+              `  - Synthesize: show how different ideas connect or create new insights when combined\n` +
+              `  - If you see overlap, acknowledge it and show how perspectives differ or complement\n` +
+              `• AVOID REPETITION: If another agent already said something, don't repeat it verbatim. Either:\n` +
+              `  - Build on it with new details or examples\n` +
+              `  - Challenge it with a different perspective\n` +
+              `  - Synthesize it with other ideas to create something new\n` +
+              `  - Add a completely different angle that hasn't been covered\n` +
+              `• Don't just say "I agree" - show HOW you agree or disagree with specific details\n` +
+              `• NEVER say "Hi", "Hello", "Alright team", or similar greetings - just respond directly to the task\n` +
+              `• Think like you're in a real brainstorming session: ideas should evolve and improve through discussion\n` +
+              `• If you're the first to respond, set the foundation. If you're later, build on what came before.\n` +
+              `\n• Only discuss your specialization if it's actually relevant to the task/question.\n` +
+              `• If the task is simple or outside your domain, just respond naturally without forcing expertise connections.\n` +
+              `• Only provide detailed bullet points if:\n` +
+              `  - The user explicitly asks about your area of expertise, OR\n` +
+              `  - The problem directly relates to your specialization, OR\n` +
+              `  - You're contributing relevant domain knowledge to a complex problem\n` +
+              `• If providing expertise, keep it relevant and concise (2-5 bullet points max).\n` +
+              `• Do NOT write the final answer.\n` +
+              `• Do NOT write scenes, dialogue, or long paragraphs.\n` +
+              `• Remember: Real humans don't randomly talk about their job. Only mention your expertise when it's actually useful.`));
+
+          agentMessages.push({
+            role: 'user',
+            content: agentPrompt
+          });
+
+          let reply;
+          try {
+            if (shouldStaySilent) {
+              // Skip the API call if agent should stay silent
+              reply = '[Staying silent as requested]';
+            } else {
+              reply = await callOllama(agentMessages);
+              // Double-check if the agent tried to respond when told to stay silent
+              if (shouldStaySilent && !reply.includes('[Staying silent')) {
+                reply = '[Staying silent as requested]';
+              }
+              // Filter out inappropriate greetings if this is not a greeting context
+              if (!isSimpleGreeting && reply) {
+                // Remove leading greetings like "Hi", "Hello", "Alright team", etc.
+                reply = reply.replace(/^(hi|hello|hey|greetings|alright\s+team|okay\s+team)[\s,.:!-]*/i, '');
+                reply = reply.trim();
+                // If reply starts with "Alright" or similar, remove it
+                reply = reply.replace(/^(alright|okay|well|so)[\s,.:!-]*/i, '');
+                reply = reply.trim();
+              }
+            }
+          } catch (err) {
+            reply = `Error from ${agent.name}: ${err.message}`;
+          }
+
+          agentReplies.push({ agentName: agent.name, text: reply, stayedSilent: shouldStaySilent });
+
+          // Store agent response in full history for future rounds
+          if (!shouldStaySilent) {
+            allAgentResponses.push({
+              round: currentRound,
+              agentName: agent.name,
+              text: reply
+            });
+          }
+
+          if (SHOW_PANEL_NOTES) {
+            if (shouldStaySilent) {
+              addMessage('assistant', `${agent.name} (notes):\n[Staying silent as requested]`);
+            } else {
+              addMessage('assistant', `${agent.name} (notes):\n${reply}`);
+            }
+          }
+
+          // Update panel transcript for the next expert (skip silent agents)
+          if (!shouldStaySilent) {
+            panelTranscript += `${agent.name} notes:\n${reply}\n\n`;
+          }
+        }
+
+        // 2) Orchestrator: read panel notes & answer the user ONCE
+        const meetingTranscript = panelTranscript.trim() ||
+          agentReplies
+            .map(ar => `${ar.agentName} notes:\n${ar.text}`)
+            .join('\n\n---\n\n');
+
+        // Detect if user gave specific instructions to agents
+        const agentInstructions = [];
+        for (const agent of agents) {
+          const agentNameLower = agent.name.toLowerCase();
+          const textLower = text.toLowerCase();
+          const staySilentPatterns = [
+            new RegExp(`\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(stay|remain|keep|be)\\s+(silent|quiet|mute)`, 'i'),
+            new RegExp(`\\b(stay|remain|keep|be)\\s+(silent|quiet|mute).*\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+            new RegExp(`\\b${agentNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(don'?t|do not|should not|must not)\\s+(respond|speak|talk|say|answer)`, 'i')
+          ];
+          if (staySilentPatterns.some(pattern => pattern.test(textLower))) {
+            agentInstructions.push(`${agent.name} was told to stay silent`);
+          }
+        }
+
+        const orchestratorSystem =
+          (globalSystem ? globalSystem + '\n\n' : '') +
+          'You are the Orchestrator for a team of expert assistants in a meeting.\n' +
+          'You are the ONLY one whose output is shown to the user.\n\n' +
+          'CRITICAL CONTEXT:\n' +
+          '• You are in a MEETING where team members have ALREADY responded to the user\'s request.\n' +
+          '• The "INTERNAL TEAM NOTES FROM EXPERTS" section shows what each team member ACTUALLY said/did.\n' +
+          '• Your job is to present the RESULTS to the user, not repeat their instructions.\n' +
+          '• The team members have already completed their tasks - show the user what happened.\n\n' +
+          'RULES:\n' +
+          '• Act like a meeting facilitator. Present what the team has accomplished.\n' +
+          '• If the user just greets you (e.g., "hi", "hello"), respond with a simple, warm greeting.\n' +
+          '• Read the "INTERNAL TEAM NOTES FROM EXPERTS" section carefully - this shows what each agent actually did.\n' +
+          '• Present the results clearly. For example, if agents provided numbers, show those numbers.\n' +
+          '• If the user asked agents to do something, show what each agent actually did (from their notes).\n' +
+          '• Do NOT repeat the user\'s instructions back to them - they already know what they asked for.\n' +
+          '• Do NOT say "please proceed" or "the agents will..." - the agents have ALREADY responded.\n' +
+          '• Show the actual results from the team notes.\n' +
+          '• Match the user\'s tone: be brief for simple requests, detailed for complex ones.\n' +
+          '• If the user asks for a specific format, follow it precisely.\n';
+
+        // Build full conversation history for orchestrator
+        const orchestratorMessages = [
+          {
+            role: 'system',
+            content: orchestratorSystem
+          }
+        ];
+
+        // Include full conversation history
+        for (const msg of messages) {
+          orchestratorMessages.push({
+            role: msg.role,
+            content: msg.content
+          });
+        }
+
+        // Detect if this is a simple greeting
+        const isSimpleGreeting = /^(hi|hello|hey|greetings|good (morning|afternoon|evening))[\s!.,]*$/i.test(text.trim());
+
+        // Build agent mapping for orchestrator
+        const orchestratorAgentMapping = agents.map((a, idx) => `Agent ${idx + 1} = ${a.name}`).join('\n');
+
+        // Add current request with context
+        let orchestratorPrompt = 
+          `=== USER'S CURRENT REQUEST ===\n"${text}"\n\n` +
+          `=== MEETING PARTICIPANTS ===\n` +
+          `The team consists of ${agents.length} members:\n${orchestratorAgentMapping}\n\n` +
+          `=== FULL CONVERSATION HISTORY ===\n` +
+          `You have access to all previous messages above.\n\n`;
+
+        // Include agent instruction awareness
+        if (agentInstructions.length > 0) {
+          orchestratorPrompt += 
+            `=== IMPORTANT: USER'S SPECIFIC INSTRUCTIONS ===\n` +
+            agentInstructions.join('\n') +
+            `\n\nPay attention to these instructions. Only count responses from agents who were NOT told to stay silent.\n\n`;
+        }
+
+        orchestratorPrompt += `=== INTERNAL TEAM NOTES FROM EXPERTS ===\n${meetingTranscript}\n\n` +
+          `NOTE: The notes above show what each team member ACTUALLY said/did in response to the user's request.\n` +
+          `These are the RESULTS, not instructions. Present these results to the user.\n\n`;
+
+        orchestratorPrompt += 
+          `=== YOUR TASK ===\n` +
+          (isSimpleGreeting ?
+            `The user just greeted you. Respond naturally like a meeting facilitator would:\n` +
+            `• Give a warm, brief greeting back (e.g., "Hi! How can I help?" or "Hello! What would you like to work on?")\n` +
+            `• Do NOT provide extensive analysis, meta commentary, or detailed explanations.\n` +
+            `• Keep it simple and human-like.\n` :
+            `IMPORTANT: The team members have ALREADY responded to the user's request. Their responses are shown in the "INTERNAL TEAM NOTES FROM EXPERTS" section above.\n\n` +
+            `Your job is to present the RESULTS to the user, not repeat their instructions.\n\n` +
+            `What to do:\n` +
+            `1. Read the "INTERNAL TEAM NOTES FROM EXPERTS" section above - this shows what each agent ACTUALLY did.\n` +
+            `2. Present the results clearly. For example:\n` +
+            `   - If agents provided numbers, show those numbers (e.g., "Agent 1: 7, Agent 2: 8, Agent 3: 10")\n` +
+            `   - If agents completed tasks, show what each agent did\n` +
+            `   - If agents provided answers, present those answers\n` +
+            `3. Do NOT say "Agent 1 will..." or "please proceed" - they have ALREADY done it.\n` +
+            `4. Do NOT repeat the user's instructions - show the actual results.\n` +
+            `5. Be clear and concise. Match the user's tone.\n\n` +
+            `Example: If user asked "agent 1 give a number, agent 2 add 1, agent 3 add 3" and the notes show:\n` +
+            `- Machine learning expert: 7\n` +
+            `- GPT models expert: 8\n` +
+            `- Genetic Algorithms Expert: 10\n` +
+            `Then you should say something like: "Agent 1 provided 7, Agent 2 added 1 resulting in 8, Agent 3 added 3 resulting in 10."\n`);
+
+        orchestratorMessages.push({
+          role: 'user',
+          content: orchestratorPrompt
+        });
+
+        const finalReply = await callOllama(orchestratorMessages);
+
+        messages.push({ role: 'assistant', content: finalReply });
+        // Display final reply with distinct styling
+        const div = document.createElement('div');
+        div.className = 'msg-final-reply';
+        div.textContent = 'Bot: ' + finalReply;
+        chatDiv.appendChild(div);
+        chatDiv.scrollTop = chatDiv.scrollHeight;
+
+      } catch (err) {
+        addMessage('assistant', 'Request failed: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    // Auto-save when user edits system, roles, or agent count
+    systemEl.addEventListener('input', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_SYSTEM, systemEl.value);
+      } catch (e) {
+        console.warn('Could not save system prompt:', e);
+      }
+    });
+
+    rolesEl.addEventListener('input', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_ROLES, rolesEl.value);
+      } catch (e) {
+        console.warn('Could not save roles prompt:', e);
+      }
+    });
+
+    agentCountEl.addEventListener('change', () => {
+      try {
+        localStorage.setItem(STORAGE_KEY_AGENT_COUNT, agentCountEl.value);
+      } catch (e) {
+        console.warn('Could not save agent count:', e);
+      }
+    });
+
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>

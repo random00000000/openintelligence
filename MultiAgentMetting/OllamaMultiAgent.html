@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ollama Multi-Agent Chat</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 20px auto; }
+    #chat { border: 1px solid #444; padding: 10px; height: 400px; overflow-y: auto; white-space: pre-wrap; }
+    .msg-user { font-weight: bold; margin-bottom: 4px; }
+    .msg-assistant { color: #0a0; margin-bottom: 4px; }
+    .msg-meta { color: #666; font-style: italic; margin-bottom: 4px; }
+    textarea { width: 100%; box-sizing: border-box; }
+    button { margin-top: 8px; }
+    label { display: block; margin: 8px 0; }
+    input[type="number"] { width: 60px; }
+  </style>
+</head>
+<body>
+  <h1>Ollama Multi-Agent Chat</h1>
+
+  <label>
+    System prompt (optional, global for everyone & the orchestrator):
+    <textarea id="system" rows="2" placeholder="You are a helpful assistant."></textarea>
+  </label>
+
+  <label>
+    Team roles (one per line, format: Name: description):
+    <textarea id="roles" rows="4" placeholder="Architect: Designs clear plans and structures.
+Skeptic: Finds flaws and risks.
+Perf Engineer: Focuses on efficiency and performance.
+Product: Cares about user experience and simplicity."></textarea>
+  </label>
+
+  <label>
+    Number of assistants in the meeting (1–8):
+    <input id="agentCount" type="number" min="1" max="8" value="3" />
+  </label>
+
+  <div id="chat"></div>
+
+  <label>
+    Your message:
+    <textarea id="input" rows="3" placeholder="Type a message..."></textarea>
+  </label>
+  <button id="sendBtn">Send</button>
+
+  <script>
+    const API_URL = 'http://localhost:11434/api/chat'; // local Ollama API
+    const MODEL   = 'deepseek-r1:8b';                  // change to whatever you pulled
+
+    const chatDiv      = document.getElementById('chat');
+    const inputEl      = document.getElementById('input');
+    const systemEl     = document.getElementById('system');
+    const rolesEl      = document.getElementById('roles');
+    const sendBtn      = document.getElementById('sendBtn');
+    const agentCountEl = document.getElementById('agentCount');
+
+    // UI-only chat log
+    const messages = [];
+
+    // Default templates if no custom roles are given
+    const DEFAULT_AGENT_TEMPLATES = [
+      {
+        name: 'Architect',
+        system: 'You are the Architect assistant. You design clear, structured plans and explain things step-by-step.'
+      },
+      {
+        name: 'Skeptic',
+        system: 'You are the Skeptic assistant. Your job is to find flaws, risks, and missing pieces in the other answers.'
+      },
+      {
+        name: 'Pragmatist',
+        system: 'You are the Pragmatist assistant. You focus on practical, simple, implementable advice.'
+      },
+      {
+        name: 'Researcher',
+        system: 'You are the Researcher assistant. You recall relevant concepts, APIs, libraries, and best practices.'
+      }
+    ];
+
+    function clampAgentsCount(raw) {
+      let n = parseInt(raw, 10);
+      if (isNaN(n)) n = 1;
+      n = Math.max(1, n);
+      n = Math.min(8, n);
+      return n;
+    }
+
+    function buildAgentsFromRolesText(n) {
+      const text = rolesEl.value.trim();
+      if (!text) {
+        // Fall back to defaults
+        return DEFAULT_AGENT_TEMPLATES
+          .slice(0, n)
+          .map(a => ({ name: a.name, system: a.system }));
+      }
+
+      const lines = text.split('\n')
+        .map(l => l.trim())
+        .filter(Boolean);
+
+      const agents = [];
+
+      for (let i = 0; i < lines.length && agents.length < n; i++) {
+        const line = lines[i];
+        const parts = line.split(':');
+        const namePart = (parts[0] || '').trim();
+        const descPart = parts.slice(1).join(':').trim();
+
+        const name = namePart || `Agent ${agents.length + 1}`;
+        const desc = descPart || 'You are an expert assistant. Give your best answer.';
+
+        agents.push({
+          name,
+          system: `You are ${name}. ${desc}`
+        });
+      }
+
+      // If fewer lines than n, pad with generic agents
+      while (agents.length < n) {
+        const idx = agents.length + 1;
+        agents.push({
+          name: `Agent ${idx}`,
+          system: `You are Agent ${idx}. You are a highly capable, helpful assistant.`
+        });
+      }
+
+      return agents;
+    }
+
+    function getActiveAgents() {
+      const n = clampAgentsCount(agentCountEl.value);
+      return buildAgentsFromRolesText(n);
+    }
+
+    function addMessage(role, content) {
+      const div = document.createElement('div');
+      if (role === 'meta') {
+        div.className = 'msg-meta';
+        div.textContent = content;
+      } else {
+        div.className = 'msg-' + role;
+        div.textContent = (role === 'user' ? 'You: ' : 'Bot: ') + content;
+      }
+      chatDiv.appendChild(div);
+      chatDiv.scrollTop = chatDiv.scrollHeight;
+    }
+
+    async function callOllama(chatMessages) {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: chatMessages,
+          stream: false
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('HTTP ' + res.status);
+      }
+
+      const data = await res.json();
+      return data.message?.content || '(no content)';
+    }
+
+    async function sendMessage() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+
+      // Show user message in UI
+      messages.push({ role: 'user', content: text });
+      addMessage('user', text);
+      inputEl.value = '';
+      sendBtn.disabled = true;
+
+      const agents = getActiveAgents();
+      const globalSystem = systemEl.value.trim();
+
+      const agentReplies = [];
+      let panelTranscript = ''; // all expert replies so far
+
+      try {
+        // 1) Run each assistant sequentially as a PANEL
+        for (const agent of agents) {
+          addMessage('meta', `[${agent.name} is speaking...]`);
+
+          const agentMessages = [];
+
+          if (globalSystem) {
+            agentMessages.push({
+              role: 'system',
+              content: globalSystem
+            });
+          }
+
+          // Role for this agent
+          agentMessages.push({
+            role: 'system',
+            content: agent.system
+          });
+
+          // Build panel-style user prompt for this agent
+          const panelContext = panelTranscript
+            ? `Other experts have already spoken. Here is the panel so far:\n\n${panelTranscript}\n\n`
+            : '';
+
+          const agentPrompt =
+            `User question:\n${text}\n\n` +
+            panelContext +
+            `You are ${agent.name}. Add your response to this panel. ` +
+            `Reference, extend, or challenge previous points when useful. ` +
+            `Stay in your specialization.`;
+
+          agentMessages.push({
+            role: 'user',
+            content: agentPrompt
+          });
+
+          let reply;
+          try {
+            reply = await callOllama(agentMessages);
+          } catch (err) {
+            reply = `Error from ${agent.name}: ${err.message}`;
+          }
+
+          agentReplies.push({ agentName: agent.name, text: reply });
+          addMessage('assistant', `${agent.name}: ${reply}`);
+
+          // Update panel transcript for the next expert
+          panelTranscript += `${agent.name}:\n${reply}\n\n`;
+        }
+
+        // 2) Orchestrator: summarize the panel & answer the user
+        const meetingTranscript = panelTranscript.trim() ||
+          agentReplies
+            .map(ar => `${ar.agentName}:\n${ar.text}`)
+            .join('\n\n---\n\n');
+
+        const orchestratorSystem =
+          (globalSystem ? globalSystem + '\n\n' : '') +
+          'You are the Orchestrator. You watched a panel discussion between several expert assistants. ' +
+          'They discussed the user\'s question. Use their points, resolve disagreements, and give the single best answer. ' +
+          'Be clear, practical, and focused.';
+
+        const orchestratorMessages = [
+          {
+            role: 'system',
+            content: orchestratorSystem
+          },
+          {
+            role: 'user',
+            content:
+              `User question:\n${text}\n\n` +
+              `Panel transcript:\n${meetingTranscript}\n\n` +
+              `Now respond directly to the user with your final answer.`
+          }
+        ];
+
+        const finalReply = await callOllama(orchestratorMessages);
+
+        messages.push({ role: 'assistant', content: finalReply });
+        addMessage('assistant', finalReply);
+
+      } catch (err) {
+        addMessage('assistant', 'Request failed: ' + err.message);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>
