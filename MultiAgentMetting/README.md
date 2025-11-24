@@ -1,30 +1,22 @@
-<img width="1059" height="874" alt="image" src="https://github.com/user-attachments/assets/aba7daf4-7b32-4cc6-96cc-4c1153b2fecf" />
+# MultiAgent Meeting (Standalone HTML)
 
+![MultiAgent Meeting interface](https://github.com/user-attachments/assets/aba7daf4-7b32-4cc6-96cc-4c1153b2fecf)
 
-1. Download the HTML file
-Download OllamaMultiAgent v7.html (or clone this repository) and keep the file somewhere on your computer.
+A single-page, offline-first interface for running multi-agent meetings locally with Ollama. Everything is contained in one HTML file—no build steps or servers required.
 
-2. Open it in your browser
-Double-click the HTML file or drag it into your browser. Because the entire interface lives in one HTML document, there is no build step or server to start.
+## Quick start
+1. **Download the HTML.** Grab `OllamaMultiAgent v7.html` (or clone this repository) and keep the file on your machine.
+2. **Open it in your browser.** Double-click the HTML file or drag it into a browser window. The entire UI runs locally.
+3. **Install and run Ollama.** PromptChain relies on your local Ollama runtime for inference. Install Ollama and keep the service running in the background while you use the app. The experience stays offline because every call targets your local runtime. [Download Ollama](https://ollama.com/download/windows).
+4. **Allow browser access (CORS).** Set `OLLAMA_ORIGINS=*` (or a more restrictive value that includes `file://`) before starting Ollama so the standalone HTML can reach the API.
 
-3. Make sure Ollama is installed
-PromptChain relies on your local Ollama installation for inference, so install Ollama if you have not already. Once installed, keep the Ollama service running in the background while you use OllamaMultiAgent v7. The app works completely offline because every call is routed to your local Ollama runtime—no cloud APIs involved. https://ollama.com/download/windows
+## Setting `OLLAMA_ORIGINS` on Windows
+1. Open **Control Panel → System → Advanced system settings**.
+2. Click **Environment Variables…**.
+3. Under **User variables** (or **System variables** to apply globally), choose **New…**.
+4. Add the following:
+   - **Variable name:** `OLLAMA_ORIGINS`
+   - **Variable value (for development):** `*` (you can tighten this to `http://localhost:8000` later)
+5. Click **OK** to close all dialogs.
 
-4. Configure CORS for browser access
-Ollama enforces CORS restrictions by default. Set the OLLAMA_ORIGINS=* environment variable (or a more restrictive value that includes file://) before starting Ollama so that your browser can reach the local API from the standalone HTML file.
-
-On Windows, do this:
-
-Open Control Panel → System → Advanced system settings
-
-Click Environment Variables…
-
-Under User variables (or System variables if you want it global), click New…
-
-Variable name: OLLAMA_ORIGINS
-
-Variable value (for development): *
-
-Later you can tighten it to http://localhost:8000 if you want.
-
-Click OK until all dialogs are closed.
+You're ready to run multi-agent meetings locally—no cloud APIs needed.
