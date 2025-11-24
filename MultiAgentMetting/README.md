@@ -7,7 +7,7 @@ A single-page, offline-first interface for running multi-agent meetings locally 
 ## Quick start
 1. **Download the HTML.** Grab `OllamaMultiAgent v7.html` (or clone this repository) and keep the file on your machine.
 2. **Open it in your browser.** Double-click the HTML file or drag it into a browser window. The entire UI runs locally.
-3. **Install and run Ollama.** PromptChain relies on your local Ollama runtime for inference. Install Ollama and keep the service running in the background while you use the app. The experience stays offline because every call targets your local runtime. [Download Ollama](https://ollama.com/download/windows).
+3. **Install and run Ollama.** MultiAgent Meeting relies on your local Ollama runtime for inference. Install Ollama and keep the service running in the background while you use the app. The experience stays offline because every call targets your local runtime. [Download Ollama](https://ollama.com/download/windows).
 4. **Allow browser access (CORS).** Set `OLLAMA_ORIGINS=*` (or a more restrictive value that includes `file://`) before starting Ollama so the standalone HTML can reach the API.
 
 ## Setting `OLLAMA_ORIGINS` on Windows
